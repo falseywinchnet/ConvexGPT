@@ -1,0 +1,64 @@
+All code in this repository copyright joshuah.rainstar@gmail.com 2025 joshuah rainstar
+This code is closed source you may not use it without license it is for sale
+
+ConvexGPT Evaluation License v1.0 (2025‑05‑03)
+
+Copyright © 2025 joshuah.rainstar@gmail.com joshuah rainstar. All rights reserved.
+
+1. Definitions
+
+"Software" means the ConvexGPT source code, models, checkpoints, documentation, and all associated files released with this License.
+"You" (or "Licensee") means any individual or entity that accesses, downloads, or uses the Software.
+
+2. Limited Evaluation Grant
+
+Subject to the terms below, You are granted a worldwide, royalty‑free, non‑transferable, non‑sublicensable license to inspect, run, and benchmark the Software solely for internal evaluation and demonstration purposes. Any other use—including but not limited to training, fine‑tuning, commercial deployment, publication of outputs, or incorporation into another product—requires a separate written Commercial License from the Copyright Holder.
+
+3. No Implied Sale
+
+This License does not convey or imply any sale, transfer, or assignment of ownership. All title, interest, and intellectual‑property rights in and to the Software remain exclusively with the Copyright Holder.
+
+4. Prohibited Acts
+
+Redistributing, sublicensing, renting, leasing, or hosting the Software (or derivative works) without a Commercial License.
+
+Removing or obscuring copyright, license, or attribution notices.
+
+Reverse‑engineering or extracting model weights beyond what is necessary for evaluation.
+
+5. Commercial License Pathway
+
+Legitimate buyers are welcome. Contact joshuah.rainstar@gmail.com to simply buy my code.
+it is for sale- the price is 32 million dollars USD.
+
+6. Enforcement & Liquidated Damages
+
+Unauthorized use constitutes willful copyright infringement. In addition to all remedies available at law or equity, You agree that:
+(a) statutory damages under 17 U.S.C.§504(c) shall be deemed willful;
+(b) actual damages shall be presumed to be the greater of three (3) times the price of the software;
+(c) You shall reimburse all reasonable attorneys’ fees, expert costs, and expenses of enforcement.
+
+7. Disclaimer of Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON‑INFRINGEMENT.
+
+8. Limitation of Liability
+
+IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, OR FOR LOST PROFITS, ARISING OUT OF OR RELATED TO THE USE OF THE SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES. TOTAL LIABILITY SHALL NOT EXCEED THE AMOUNT PAID BY YOU FOR THE COMMERCIAL LICENSE, IF ANY.
+
+9. Indemnity
+
+You agree to indemnify, defend, and hold harmless the Copyright Holder from any claim or demand arising out of Your violation of this License or misuse of the Software.
+
+10. Governing Law & Venue
+
+This License is governed by the laws of the State of Delaware, USA, without regard to conflict‑of‑law principles. Any dispute shall be resolved exclusively in the state or federal courts located in Wilmington, Delaware, and You consent to personal jurisdiction therein.
+
+11. Termination
+
+This License terminates automatically if You breach any term. Upon termination, You must immediately cease all use and destroy all copies of the Software.
+
+12. Acceptance
+
+By downloading, copying, or using the Software, You acknowledge that You have read, understood, and agree to be bound by the terms of this License.
+
