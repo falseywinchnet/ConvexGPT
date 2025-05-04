@@ -936,13 +936,49 @@ class ConvexGPT(nn.Module):
         ])
         self.ln_f = nn.LayerNorm(embed_dim)
         self.unembedding = nn.Parameter(torch.randn(embed_dim, vocab_size))
-        self.small = nn.Linear(embed_dim//2, embed_dim)
         self.head = nn.Linear(embed_dim, vocab_size, bias=False)
-
+        self.df = 2.71828  # Student-t degrees of freedom
+        
+    @staticmethod
+    def _student_t_unembedding(hidden_states, unembedding, nu:float):
+        """
+        Student-t based unembedding producing log-probabilities over vocabulary.
+    
+        Args:
+          hidden_states: (B, S, D)   - model outputs
+          unembedding:   (D, V)      - class/token embeddings (transposed weight matrix)
+          nu (float): degrees of freedom for Student-t
+          eps (float): numerical epsilon
+    
+        Returns:
+          log_p: (B, S, V) - log-probability over V tokens
+        """
+        eps = 1e-9
+        x2 = hidden_states.pow(2).sum(dim=-1, keepdim=True)             # (B, S, 1)
+        w2 = unembedding.pow(2).sum(dim=0, keepdim=True).unsqueeze(0)   # (1, 1, V)
+        xw = torch.matmul(hidden_states, unembedding)                   # (B, S, V)
+        
+        dist2 = x2 - 2 * xw + w2
+        dist2 = dist2.clamp_min(eps)
+        
+        D = hidden_states.size(-1)
+        log_kernel = -0.5 * (nu + D) * torch.log1p(dist2 / nu)          # (B, S, V)
+        
+        return F.log_softmax(log_kernel, dim=-1)
+        
     @staticmethod
     def _causal_mask(S: int, device: torch.device) -> torch.Tensor:
         # shape (1, 1, S, S) where True = allowed
         return torch.tril(torch.ones(S, S, dtype=torch.bool, device=device)).unsqueeze(0).unsqueeze(1)
+
+    def forward_no_student(self, idx: torch.Tensor):
+        B, S = idx.shape
+        device = idx.device
+        x = self.token_emb(idx)
+        mask = self._causal_mask(S, device)
+        for blk in self.blocks:
+            x = blk(x, mask)
+        return self.head(self.ln_f(x))
 
     def forward(self, idx: torch.Tensor):
         B, S = idx.shape
@@ -951,13 +987,12 @@ class ConvexGPT(nn.Module):
         mask = self._causal_mask(S, device)
         for blk in self.blocks:
             x = blk(x, mask)
-            a, b = x.chunk(2, dim=-1)     # x: (B, S, E) → a, b: (B, S, E/2)
-            x = 0.5 * (a + b) - a * b       # (B, S, E/2)
-            x = self.small(x)              # e.g., nn.Linear(E/2, E) to restore dim
-        return self.head(self.ln_f(x))
+        x = self.ln_f(x)
+        return self._student_t_unembedding(x, self.unembedding, nu=self.df)
 
 '''
 '''
+#training loop WITHOUT student_t
 import os
 import pickle
 import numpy as np
@@ -1093,5 +1128,211 @@ for epoch in range(1, num_epochs+1):
     train_loss = train_epoch() 
     val_loss   = eval_epoch()
     print(f"Epoch {epoch:2d} | train: {train_loss:.4f} | val: {val_loss:.4f}")
-'''
 
+
+
+# --- helpers ---------------------------------------------------------
+def fenchel_decode(logits, tau=1.0, iters=3):
+    """Fenchel‑dual KL‑regularised projection of -logits (energy)."""
+    energy = -logits                        # (B,V)
+    p = torch.full_like(energy, 1.0 / energy.size(-1))  # uniform start
+    for _ in range(iters):
+        p = torch.softmax((-energy / tau) + p.log(), dim=-1)
+    return p
+    
+
+# --- generation ------------------------------------------------------
+use_fenchel   = False          # flip to compare
+tau           = 1.0           # λ  (temperature analogue)
+max_new_tokens = 4000
+top_k          = 25
+block_size     = 128
+temperature    = 2.0
+
+bcontext_str = "To be, or not to be,"
+context_ids = torch.tensor([[ stoi[c] for c in bcontext_str ]],
+                           dtype=torch.long)
+context_ids = context_ids.to(device)
+
+
+generated = context_ids.clone()  # (1,T0)
+model.eval()
+with torch.no_grad():
+  for _ in range(max_new_tokens):
+    input_ids = generated[:, -block_size:]        # casual block
+    logits = model(input_ids)[:, -1, :] / temperature
+    # top‑k mask
+    if top_k is not None:
+        v, _ = torch.topk(logits, top_k)
+        logits[logits < v[:, [-1]]] = -1e10
+
+    if use_fenchel:
+        probs = fenchel_decode(logits, tau=tau, iters=3)
+    else:
+        probs = torch.softmax(logits, dim=-1)
+
+    next_id = torch.multinomial(probs, num_samples=1)   # (1,1)
+    generated = torch.cat([generated, next_id], dim=1)
+
+print('> ', ''.join(itos[i] for i in generated[0].tolist()))
+
+'''
+'''
+#training loop *WITH* student-t
+
+# --- simple generation loop ------------------------------------------
+import os
+import pickle
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from torch.optim import AdamW
+from torch.optim.optimizer import Optimizer
+from typing import Literal
+device    = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+@torch.jit.script
+def wolf_update(p: torch.Tensor,
+                g: torch.Tensor,
+                state_p: torch.Tensor,
+                lr: float):
+    # define your constants here instead of capturing them
+    etcerta: float = 0.367879441
+    et:      float = 1.0 - etcerta
+
+    # same logic as before
+    update    = state_p * et + g * etcerta
+    new_state = state_p * et + update * etcerta
+    sign_agree = torch.sign(update) * torch.sign(g)
+    update    = update + (torch.rand_like(update)*2 - 1) * etcerta * update
+    p_new     = torch.where(sign_agree > 0, p - lr * update, p)
+    return p_new, new_state
+
+class Wolf(Optimizer):
+    def __init__(self, params, lr=1e-3):
+        defaults = dict(lr=lr)
+        super().__init__(params, defaults)
+        for group in self.param_groups:
+            for p in group['params']:
+                self.state[p]['p'] = torch.zeros_like(p)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+        for group in self.param_groups:
+            lr = group['lr']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                state_p = self.state[p]['p']
+                p_new, new_state = wolf_update(p.data, p.grad, state_p, lr)
+                p.data.copy_(p_new)
+                state_p.copy_(new_state)
+        return loss
+
+# 1) Load data and meta as before
+data_dir  = os.path.dirname(base_dir)
+train_ids = np.fromfile(os.path.join(data_dir, 'train.bin'), dtype=np.uint16)
+val_ids   = np.fromfile(os.path.join(data_dir, 'val.bin'),   dtype=np.uint16)
+with open(os.path.join(data_dir, 'meta.pkl'), 'rb') as f:
+    meta = pickle.load(f)
+vocab_size = meta['vocab_size']
+
+# 2) Compute data‐marginal q[v]
+counts = np.bincount(train_ids, minlength=vocab_size).astype(float)
+q = torch.tensor(counts / counts.sum(), dtype=torch.float32, device=device)  # [V]
+
+# 3) Dataset + DataLoader
+class CharDataset(Dataset):
+    def __init__(self, data, block_size):
+        self.data = torch.from_numpy(data).long()
+        self.block_size = block_size
+    def __len__(self):
+        return len(self.data) - self.block_size
+    def __getitem__(self, idx):
+        x = self.data[idx : idx + self.block_size]
+        y = self.data[idx + 1 : idx + self.block_size + 1]
+        return x, y
+
+block_size = 256
+train_loader = DataLoader(CharDataset(train_ids, block_size),
+                          batch_size=32, shuffle=True, drop_last=True)
+val_loader   = DataLoader(CharDataset(val_ids,   block_size),
+                          batch_size=32, shuffle=False, drop_last=True)
+
+# 4) Model, optimizer, loss
+virgin = ConvexGPT(vocab_size = vocab_size,embed_dim  = 384,depth  = 6,heads = 6,petals = 2)
+
+# (Optional) Re‑initialise *only* the PositiveLinear layers:
+print("Number of parameters: ", sum(p.numel() for p in virgin.parameters()))
+model = torch.jit.script(virgin)
+model.to(device)
+optimizer = AdamW(model.parameters(), lr=1e-2)
+criterion = nn.CrossEntropyLoss()
+losses = []
+# 6) Train / eval functions
+def train_epoch():
+    model.train()
+    total_loss = 0
+    for xb, yb in train_loader:
+        xb, yb = xb.to(device), yb.to(device)
+
+        # Forward
+        log_probs = model(xb)                 # (B, T, V)
+        B, T, V = log_probs.shape
+
+        # 1) Standard CE
+        loss = F.nll_loss(log_probs.view(-1, V), yb.view(-1))
+
+        # Backprop
+        optimizer.zero_grad()
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)        
+        optimizer.step()
+        print(loss.item()/(32*128))
+        total_loss += loss.item()
+        losses.append(loss.item())
+    return total_loss / len(train_loader)
+
+@torch.no_grad()
+def eval_epoch():
+    model.eval()
+    total_loss = 0
+    for xb, yb in val_loader:
+        xb, yb = xb.to(device), yb.to(device)
+        logits = model(xb)
+        B, T, V = logits.shape
+        total_loss += criterion(logits.view(B*T,V),
+                                yb.view(B*T)).item()
+    return total_loss / len(val_loader)
+
+# 7) Run training
+num_epochs = 10
+for epoch in range(1, num_epochs+1):
+    train_loss = train_epoch() 
+    val_loss   = eval_epoch()
+    print(f"Epoch {epoch:2d} | train: {train_loss:.4f} | val: {val_loss:.4f}")
+model.eval()
+generated = context_ids.clone()  # Start sequence
+
+with torch.no_grad():
+    for _ in range(max_new_tokens):
+        input_ids = generated[:, -block_size:]  # Crop to block size
+        logits = model(input_ids)               # Forward pass
+        logits = logits[:, -1, :] / temperature # Get last token logits
+
+        # Apply top-k filtering if enabled
+        if top_k is not None:
+            v, _ = torch.topk(logits, top_k)
+            logits[logits < v[:, [-1]]] = -1e10
+
+        # Softmax sampling
+        probs = torch.softmax(logits, dim=-1)
+        next_id = torch.multinomial(probs, num_samples=1)
+        generated = torch.cat([generated, next_id], dim=1)
+
+# Decode output
+print('> ', ''.join(itos[i] for i in generated[0].tolist()))
