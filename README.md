@@ -7,8 +7,9 @@ Mostly Convex ICNN based Large Language Model - Commercial Code - this repositor
 * 2: cleanly vectorizable, cache capabilities implementable. scales the same as GPT in cost.
 * 3: vastly Lower-precision friendly and higher robustness to adversarial or out-of-distribution input
 * 4: no sequential bottlenecks from scaling
-* 5: Lipschitz is tight, jacobian positive semidefinite, all information lives on hyperplanes
-* 6: did i mention it was made in america?
+* 5: Extreme Nonlinear separability
+* 6: Lipschitz is tight, jacobian positive semidefinite, all information lives on hyperplanes
+* 7: did i mention it was made in america?
 
 example model:
 embed 384, layer 4, head 4, leaf 2. batch 32, block 128.
