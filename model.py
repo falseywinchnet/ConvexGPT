@@ -1317,6 +1317,19 @@ for epoch in range(1, num_epochs+1):
     print(f"Epoch {epoch:2d} | train: {train_loss:.4f} | val: {val_loss:.4f}")
 
     
+
+
+# --- generation ------------------------------------------------------
+max_new_tokens = 400
+top_k          = 1
+block_size     = 128
+temperature    = 1.0
+
+bcontext_str = "To be, or not to be,"
+context_ids = torch.tensor([[ stoi[c] for c in bcontext_str ]],
+                           dtype=torch.long)
+context_ids = context_ids.to(device)
+
 generated = context_ids.clone()
 model.eval()
 with torch.no_grad():
@@ -1333,4 +1346,5 @@ with torch.no_grad():
         generated = torch.cat([generated, next_id], dim=1)
 
 print('> ', ''.join(itos[i] for i in generated[0].tolist()))
+
 '''
