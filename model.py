@@ -138,7 +138,7 @@ class S4PreMix(nn.Module):
         self.heads = heads
         self.d_k = embed_dim // heads
         # choose number of modes = d_k
-        self.N_modes = self.d_k
+        self.N_modes = d_k #cannot meaningfully use more than this! 
         # S4D preprocessing
         self.s4d = S4DFFT(d_model=self.d_k, N=self.N_modes)
         # QKV projection at inner_dim = embed_dim
@@ -376,7 +376,7 @@ class PairwiseHullAttention(nn.Module):
             self.pre = S4PreMix(embed_dim, heads, petals, True)
         else:
             self.pre = LinearPreMix(embed_dim, heads, petals, False)
-        self.mixer = ConvexMixer(self.d_k, petals, self.d_k // 2)
+        self.mixer = ConvexMixer(self.d_k, petals, self.d_k*2)
         self.pos = ConvexPositionalBias(heads)
         self.W_O = nn.Linear(embed_dim, embed_dim, bias=False)
 
@@ -439,7 +439,6 @@ class ConvexGPT(nn.Module):
         for blk in self.blocks:
             x = blk(x, mask)
         return self.head(self.ln_f(x))
-
 
 
 '''
