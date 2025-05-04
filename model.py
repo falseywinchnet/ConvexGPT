@@ -1315,24 +1315,22 @@ for epoch in range(1, num_epochs+1):
     train_loss = train_epoch() 
     val_loss   = eval_epoch()
     print(f"Epoch {epoch:2d} | train: {train_loss:.4f} | val: {val_loss:.4f}")
-model.eval()
-generated = context_ids.clone()  # Start sequence
 
+    
+generated = context_ids.clone()
+model.eval()
 with torch.no_grad():
     for _ in range(max_new_tokens):
-        input_ids = generated[:, -block_size:]  # Crop to block size
-        logits = model(input_ids)               # Forward pass
-        logits = logits[:, -1, :] / temperature # Get last token logits
+        input_ids = generated[:, -block_size:]
+        logprobs = model(input_ids)[:, -1, :]  # already log-softmaxed
 
-        # Apply top-k filtering if enabled
         if top_k is not None:
-            v, _ = torch.topk(logits, top_k)
-            logits[logits < v[:, [-1]]] = -1e10
+            topv, _ = torch.topk(logprobs, top_k)
+            logprobs[logprobs < topv[:, [-1]]] = -1e10  # still in log-space
 
-        # Softmax sampling
-        probs = torch.softmax(logits, dim=-1)
+        probs = logprobs.exp()  # convert to actual probs (optional: renormalize)
         next_id = torch.multinomial(probs, num_samples=1)
         generated = torch.cat([generated, next_id], dim=1)
 
-# Decode output
 print('> ', ''.join(itos[i] for i in generated[0].tolist()))
+'''
