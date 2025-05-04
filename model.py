@@ -489,7 +489,15 @@ print('> ', ''.join(itos[i] for i in generated[0].tolist()))
 '''
 '''
 experimental: dont use.
-adds: noise, student_t, xor between blocks with a universal projector(no idea what it will do)
+adds: noise, xor between blocks with a universal projector(no idea what it will do)
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from pathlib import Path
+from typing import List,Literal
+
 
 class S4DFFT(nn.Module):
     """
@@ -928,36 +936,8 @@ class ConvexGPT(nn.Module):
         ])
         self.ln_f = nn.LayerNorm(embed_dim)
         self.unembedding = nn.Parameter(torch.randn(embed_dim, vocab_size))
-        self.df = 2.71828  # Student-t degrees of freedom
         self.small = nn.Linear(embed_dim//2, embed_dim)
-
-
-    @staticmethod
-    def _student_t_unembedding(hidden_states, unembedding, nu:float):
-        """
-        Student-t based unembedding producing log-probabilities over vocabulary.
-    
-        Args:
-          hidden_states: (B, S, D)   - model outputs
-          unembedding:   (D, V)      - class/token embeddings (transposed weight matrix)
-          nu (float): degrees of freedom for Student-t
-          eps (float): numerical epsilon
-    
-        Returns:
-          log_p: (B, S, V) - log-probability over V tokens
-        """
-        eps = 1e-9
-        x2 = hidden_states.pow(2).sum(dim=-1, keepdim=True)             # (B, S, 1)
-        w2 = unembedding.pow(2).sum(dim=0, keepdim=True).unsqueeze(0)   # (1, 1, V)
-        xw = torch.matmul(hidden_states, unembedding)                   # (B, S, V)
-        
-        dist2 = x2 - 2 * xw + w2
-        dist2 = dist2.clamp_min(eps)
-        
-        D = hidden_states.size(-1)
-        log_kernel = -0.5 * (nu + D) * torch.log1p(dist2 / nu)          # (B, S, V)
-        
-        return F.log_softmax(log_kernel, dim=-1)
+        self.head = nn.Linear(embed_dim, vocab_size, bias=False)
 
     @staticmethod
     def _causal_mask(S: int, device: torch.device) -> torch.Tensor:
@@ -974,7 +954,144 @@ class ConvexGPT(nn.Module):
             a, b = x.chunk(2, dim=-1)     # x: (B, S, E) → a, b: (B, S, E/2)
             x = 0.5 * (a + b) - a * b       # (B, S, E/2)
             x = self.small(x)              # e.g., nn.Linear(E/2, E) to restore dim
-        x = self.ln_f(x)
-        return self._student_t_unembedding(x, self.unembedding, nu=self.df)
+        return self.head(self.ln_f(x))
+
+'''
+'''
+import os
+import pickle
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from torch.optim import AdamW
+from torch.optim.optimizer import Optimizer
+from typing import Literal
+device    = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+@torch.jit.script
+def wolf_update(p: torch.Tensor,
+                g: torch.Tensor,
+                state_p: torch.Tensor,
+                lr: float):
+    # define your constants here instead of capturing them
+    etcerta: float = 0.367879441
+    et:      float = 1.0 - etcerta
+
+    # same logic as before
+    update    = state_p * et + g * etcerta
+    new_state = state_p * et + update * etcerta
+    sign_agree = torch.sign(update) * torch.sign(g)
+    update    = update + (torch.rand_like(update)*2 - 1) * etcerta * update
+    p_new     = torch.where(sign_agree > 0, p - lr * update, p)
+    return p_new, new_state
+
+class Wolf(Optimizer):
+    def __init__(self, params, lr=1e-3):
+        defaults = dict(lr=lr)
+        super().__init__(params, defaults)
+        for group in self.param_groups:
+            for p in group['params']:
+                self.state[p]['p'] = torch.zeros_like(p)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+        for group in self.param_groups:
+            lr = group['lr']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                state_p = self.state[p]['p']
+                p_new, new_state = wolf_update(p.data, p.grad, state_p, lr)
+                p.data.copy_(p_new)
+                state_p.copy_(new_state)
+        return loss
+
+# 1) Load data and meta as before
+data_dir  = os.path.dirname(base_dir)
+train_ids = np.fromfile(os.path.join(data_dir, 'train.bin'), dtype=np.uint16)
+val_ids   = np.fromfile(os.path.join(data_dir, 'val.bin'),   dtype=np.uint16)
+with open(os.path.join(data_dir, 'meta.pkl'), 'rb') as f:
+    meta = pickle.load(f)
+vocab_size = meta['vocab_size']
+
+# 2) Compute data‐marginal q[v]
+counts = np.bincount(train_ids, minlength=vocab_size).astype(float)
+q = torch.tensor(counts / counts.sum(), dtype=torch.float32, device=device)  # [V]
+
+# 3) Dataset + DataLoader
+class CharDataset(Dataset):
+    def __init__(self, data, block_size):
+        self.data = torch.from_numpy(data).long()
+        self.block_size = block_size
+    def __len__(self):
+        return len(self.data) - self.block_size
+    def __getitem__(self, idx):
+        x = self.data[idx : idx + self.block_size]
+        y = self.data[idx + 1 : idx + self.block_size + 1]
+        return x, y
+
+block_size = 256
+train_loader = DataLoader(CharDataset(train_ids, block_size),
+                          batch_size=32, shuffle=True, drop_last=True)
+val_loader   = DataLoader(CharDataset(val_ids,   block_size),
+                          batch_size=32, shuffle=False, drop_last=True)
+
+# 4) Model, optimizer, loss
+virgin = ConvexGPT(vocab_size = vocab_size,embed_dim  = 384,depth  = 4,heads = 6,petals = 2)
+
+# (Optional) Re‑initialise *only* the PositiveLinear layers:
+print("Number of parameters: ", sum(p.numel() for p in virgin.parameters()))
+model = torch.jit.script(virgin)
+model.to(device)
+optimizer = Wolf(model.parameters(), lr=0.1)#or adam, but i prefer the WOLF.
+criterion = nn.CrossEntropyLoss()
+losses = []
+# 6) Train / eval functions
+def train_epoch():
+    model.train()
+    total_loss = 0
+    for xb, yb in train_loader:
+        xb, yb = xb.to(device), yb.to(device)
+
+        # Forward
+        logits = model(xb)                 # (B, T, V)
+        B, T, V = logits.shape
+        p = F.softmax(logits, dim=-1)      # (B, T, V)
+
+        # 1) Standard CE
+        loss = criterion(logits.view(B*T, V),
+                            yb.view(B*T))
+        # Backprop
+        optimizer.zero_grad()
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)#because things do explode sometimes
+        optimizer.step()
+        print(loss.item())
+        total_loss += loss.item()
+        losses.append(loss.item())
+    return total_loss / len(train_loader)
+
+@torch.no_grad()
+def eval_epoch():
+    model.eval()
+    total_loss = 0
+    for xb, yb in val_loader:
+        xb, yb = xb.to(device), yb.to(device)
+        logits = model(xb)
+        B, T, V = logits.shape
+        total_loss += criterion(logits.view(B*T,V),
+                                yb.view(B*T)).item()
+    return total_loss / len(val_loader)
+
+# 7) Run training
+num_epochs = 10
+for epoch in range(1, num_epochs+1):
+    train_loss = train_epoch() 
+    val_loss   = eval_epoch()
+    print(f"Epoch {epoch:2d} | train: {train_loss:.4f} | val: {val_loss:.4f}")
 '''
 
