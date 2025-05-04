@@ -489,8 +489,8 @@ print('> ', ''.join(itos[i] for i in generated[0].tolist()))
 '''
 '''
 experimental: dont use.
-adds: noise, student_t.
-designed to both improve interpretability as well as flexibility.
+adds: noise, student_t, xor between blocks with a universal projector(no idea what it will do)
+
 class S4DFFT(nn.Module):
     """
     Diagonal State‑Space (S4D) layer with length‑agnostic FFT or recurrent scan.
@@ -929,6 +929,8 @@ class ConvexGPT(nn.Module):
         self.ln_f = nn.LayerNorm(embed_dim)
         self.unembedding = nn.Parameter(torch.randn(embed_dim, vocab_size))
         self.df = 2.71828  # Student-t degrees of freedom
+        self.small = nn.Linear(embed_dim//2, embed_dim)
+
 
     @staticmethod
     def _student_t_unembedding(hidden_states, unembedding, nu:float):
@@ -969,6 +971,9 @@ class ConvexGPT(nn.Module):
         mask = self._causal_mask(S, device)
         for blk in self.blocks:
             x = blk(x, mask)
+            a, b = x.chunk(2, dim=-1)     # x: (B, S, E) → a, b: (B, S, E/2)
+            x = 0.5 * (a + b) - a * b       # (B, S, E/2)
+            x = self.small(x)              # e.g., nn.Linear(E/2, E) to restore dim
         x = self.ln_f(x)
         return self._student_t_unembedding(x, self.unembedding, nu=self.df)
 '''
