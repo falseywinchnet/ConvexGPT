@@ -5,11 +5,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from pathlib import Path
-from typing import List, Literal
+from typing import List
+
+
+import torch, torch.nn as nn, torch.nn.functional as F, math
+from typing import Literal
 
 # --------‑‑‑‑ helper ---------------------------------------------------
-@torch.jit.script   
+@torch.jit.script   # optional: proves it scripts
 def next_pow_two(x: int) -> int:
+    """
+    TorchScript‑safe power‑of‑two ceiling using tensor math.
+    """
     t = torch.tensor(float(x))            # scalar tensor
     k = torch.ceil(torch.log2(t)).int()   # round‑up exponent
     return int((2 ** k).item())           # convert back to Python int
@@ -53,7 +60,7 @@ class S4DFFT(nn.Module):
 
         self._init_modes(init)
 
- 
+    # ----- initialisers --------------------------------------------------
     def _init_modes(self, kind: Literal["hippoD", "inverse", "linear"]):
         n = torch.arange(self.N // 2)
         with torch.no_grad():
@@ -69,7 +76,9 @@ class S4DFFT(nn.Module):
             nn.init.normal_(self.B,  mean=1.0, std=0.2)
             nn.init.normal_(self.C,  std=1.0 / math.sqrt(self.N/2))
 
-
+    # ---------------------------------------------------------------------------
+    # Real‑only kernel builder
+    # ---------------------------------------------------------------------------
     def _kernel_fft(self, T: int):
         """
         Return RFFT(K) where K is the real convolution kernel of length T.
@@ -122,32 +131,53 @@ class S4DFFT(nn.Module):
 
 
 class S4PreMix(nn.Module):
-    def __init__(self, embed_dim, inner_dim, heads, N_modes=64):
+    def __init__(self, embed_dim: int, heads: int, petals: int, use_s4d = True):
         super().__init__()
-        assert inner_dim % heads == 0
+        # compute per-head and inner dimensions
+        assert embed_dim % heads == 0, "embed_dim must be divisible by heads"
         self.heads = heads
-        self.d_k   = inner_dim // heads
+        self.d_k = embed_dim // heads
+        # choose number of modes = d_k
+        self.N_modes = self.d_k
+        # S4D preprocessing
+        self.s4d = S4DFFT(d_model=self.d_k, N=self.N_modes)
+        # QKV projection at inner_dim = embed_dim
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
 
-        # ---- NEW: linear up‑proj to inner_dim -------------------------
-        self.up   = nn.Linear(embed_dim, inner_dim, bias=False)
-
-        # ---- S4D operates at reduced width ---------------------------
-        self.s4d  = S4DFFT(d_model=inner_dim, N=N_modes)
-        self.qkv  = nn.Linear(inner_dim, inner_dim * 3, bias=False)
-
-    def forward(self, x):                       # x: (B,S,E)
-        z  = self.s4d(self.up(x))               # (B,S,inner_dim)
-        q, k, v = self.qkv(z).chunk(3, dim=-1)  # each (B,S,inner_dim)
-
-        B, S, _ = x.shape
-        new_shape = (B, S, self.heads, self.d_k)
-
-        # safe reshape regardless of contiguity
-        q = q.reshape(new_shape).transpose(1, 2)   # (B,H,S,d_k)
-        k = k.reshape(new_shape).transpose(1, 2)
-        v = v.reshape(new_shape).transpose(1, 2)
+    def forward(self, x: torch.Tensor):
+        # x: (B, S, embed_dim)
+        B, S, E = x.shape
+        # apply per-head S4 after projecting to embed_dim
+        x = x.view(B * self.heads, S, self.d_k)
+        x = self.s4d(x)
+        x = x.view(B, S, E)
+        # compute QKV
+        qkv = self.qkv(x)  # (B, S, 3*E)
+        q, k, v = qkv.chunk(3, dim=-1)
+        # reshape to heads
+        q = q.view(B, S, self.heads, self.d_k).transpose(1,2)
+        k = k.view(B, S, self.heads, self.d_k).transpose(1,2)
+        v = v.view(B, S, self.heads, self.d_k).transpose(1,2)
         return q, k, v
 
+class LinearPreMix(nn.Module):
+    def __init__(self, embed_dim: int, heads: int, petals: int, use_s4d: bool = False):
+        super().__init__()
+        assert embed_dim % heads == 0, "embed_dim must be divisible by heads"
+        self.heads = heads
+        self.d_k = embed_dim // heads
+        # direct QKV projection
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
+
+    def forward(self, x: torch.Tensor):
+        # x: (B, S, embed_dim)
+        B, S, E = x.shape
+        qkv = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.view(B, S, self.heads, self.d_k).transpose(1,2)
+        k = k.view(B, S, self.heads, self.d_k).transpose(1,2)
+        v = v.view(B, S, self.heads, self.d_k).transpose(1,2)
+        return q, k, v
         
 # ----------  Positive weight layer with Hoedt–Klambauer init ----------
 # ---------------------------------------------------------------------
@@ -176,26 +206,13 @@ class ICNN(nn.Module):
         layers = [PositiveLinear(dim if i==0 else h, h) for i, h in enumerate(hidden_dims)]
         layers.append(PositiveLinear(hidden_dims[-1], dim))        # keep dimension
         self.layers = nn.ModuleList(layers)
-        self.ReLU = nn.Softplus()
+        self.softplus = nn.Softplus()
 
     def forward(self, x):                                          # (..., D)
         z = x
         for layer in self.layers:
-            z = self.ReLU(layer(z))
+            z = self.softplus(layer(z))
         return z
-
-
-
-#locally convex gate
-class ConvexGate(nn.Module):
-    def __init__(self, in_dim):
-        super().__init__()
-        self.lin = nn.Linear(in_dim, 1, bias=True)
-        self.ReLU = nn.Softplus()
-
-    def forward(self, x):                       # (...,D)
-        u = self.ReLU(self.lin(x))             # convex, ≥0
-        return 1.0 - torch.exp(-u)              # convex, ∈(0,1)
 
 
 class ConvexGate(nn.Module):
@@ -205,10 +222,10 @@ class ConvexGate(nn.Module):
     def __init__(self, in_dim: int):
         super().__init__()
         self.lin = nn.Linear(in_dim, 1, bias=True)
-        self.ReLU = nn.Softplus()
+        self.softplus = nn.Softplus()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        u = self.ReLU(self.lin(x))      # convex, ≥ 0
+        u = self.softplus(self.lin(x))      # convex, ≥ 0
         return 1.0 - torch.exp(-u)       # convex, ∈ (0,1)
 
 class ScalarHull(nn.Module):
@@ -264,31 +281,6 @@ class ValueICNN(nn.Module):
         v = self.vh(x.reshape(-1, E))    # (B*S, E)
         return v.view(B, S, E)
 
-
-class LinearPreMix(nn.Module):
-
-    def __init__(self, embed_dim, inner_dim, heads,N_modes):
-        super().__init__()
-        assert inner_dim % heads == 0
-        self.heads = heads
-        self.d_k   = inner_dim // heads
-
-        self.up   = nn.Linear(embed_dim, inner_dim,  bias=False)   # optional width lift
-        self.qkv  = nn.Linear(inner_dim, inner_dim * 3, bias=False)
-
-    def forward(self, x):               # x:(B,S,E)
-        z        = self.up(x)           # (B,S,inner_dim)
-        q, k, v  = self.qkv(z).chunk(3, dim=-1)
-
-        B, S, _  = x.shape
-        new_shape= (B, S, self.heads, self.d_k)
-
-        q = q.reshape(new_shape).transpose(1,2)  # (B,H,S,d_k)
-        k = k.reshape(new_shape).transpose(1,2)
-        v = v.reshape(new_shape).transpose(1,2)
-        return q, k, v
-
-
 class ConvexPositionalBias(nn.Module):
     """
     Bias(i,j) = - w * |i-j|    with   w ≥ 0  (learned per head)
@@ -307,88 +299,101 @@ class ConvexPositionalBias(nn.Module):
         bias = - w[:, None, None] * dist                # (H,S,S)
         return bias
 
+class ConvexMixer(nn.Module):
+    """Numerically‑robust replacement for ConvexSoftMixer.
+
+    The design goals are:
+    * keep the convex, non‑negative kernel factorisation (phi_q, phi_k ≥ 0)
+    * combine with per‑token convex scores f_q, g_k and extra positional bias
+    * avoid `exp` overflow by working in log‑space up to the final softmax
+    * expose a temperature parameter for controllable sharpness
     """
-efficient softmax version
-class ConvexHullMixer(nn.Module):
 
-    y[b,h,i,d] = Σ_j softmax( (q·kᵀ)/√d + bias )[b,h,i,j] · V[b,h,j,d]
-
-    Implemented with `torch.matmul` to avoid fragile `einsum` shape errors.
-    def __init__(self, d_k: int):
+    def __init__(self, d_k: int, petals: int, r: int):
         super().__init__()
-        self.val = nn.Linear(d_k, d_k, bias=False)
+        self.temperature = torch.tensor(1.0 / math.sqrt(d_k))
+        # convex, per‑token scalar scores
+        from typing import List
+        class ScalarHull(nn.Module):
+            def __init__(self, d: int, hidden: List[int], petals: int):
+                super().__init__()
+                self.petals = nn.ModuleList([nn.Sequential(nn.Linear(d, h), nn.Softplus(), nn.Linear(h, 1)) for h in hidden for _ in range(petals)])
+            def forward(self, x):  # (..., d)
+                outs = torch.stack([p(x) for p in self.petals], dim=-1).squeeze(-2)  # (..., P)
+                return torch.logsumexp(outs, dim=-1)  # (...,)
 
-    def forward(
-        self,
-        q: torch.Tensor,              # (B, H, S, d)
-        k: torch.Tensor,              # (B, H, S, d)
-        v: torch.Tensor,              # (B, H, S, d)
-        extra_score: torch.Tensor | None = None  # (1|B, H, S, S)
-    ) -> torch.Tensor:               # returns (B, H, S, d)
+        self.score_q = ScalarHull(d_k, [d_k], petals)
+        self.score_k = ScalarHull(d_k, [d_k], petals)
+
+        # non‑negative random‑feature maps
+        self.lin_h_q = nn.Linear(d_k, r, bias=False)
+        self.lin_h_k = nn.Linear(d_k, r, bias=False)
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, extra_score) -> torch.Tensor:  
+        """q,k,v: (B, H, S, d_k)  *extra_score*: (1|B, 1|H, S, S)"""
         B, H, S, D = q.shape
-        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(D)  # (B,H,S,S)
+
+        # === 1. Convex token scores ========================================
+        f_q = self.score_q(q)               # (B,H,S)
+        g_k = self.score_k(k)               # (B,H,S)
+
+        # === 2. Non‑negative kernel =======================================
+        # use softplus to guarantee positivity but cap the raw values before exp
+        raw_phi_q = self.lin_h_q(q).clamp(max=20.0)
+        raw_phi_k = self.lin_h_k(k).clamp(max=20.0)
+        phi_q = F.softplus(raw_phi_q)       # (B,H,S,r)
+        phi_k = F.softplus(raw_phi_k)       # (B,H,S,r)
+        kernel = torch.einsum('bhsr,bhtr->bhst', phi_q, phi_k) + 1e-6  # (B,H,S,S)
+        log_kernel = kernel.log()           # (B,H,S,S)
+
+        # === 3. Combine all scores in log‑space ============================
+        logit = (f_q.unsqueeze(-1) + g_k.unsqueeze(-2) + log_kernel) / self.temperature
         if extra_score is not None:
-            scores = scores + extra_score  # broadcast OK
+            logit = logit + extra_score
 
-        attn = F.softmax(scores, dim=-1)
-        y    = torch.matmul(attn, self.val(v))  # (B,H,S,d)
-        return y
-     """
+        # === 4. Row‑wise softmax with log‑sum‑exp trick ====================
+        logit = logit - logit.max(dim=-1, keepdim=True).values      # stabilise
+        weight = logit.exp()
+        weight = weight / weight.sum(dim=-1, keepdim=True)          # (B,H,S,S)
 
-#softmax-free mostly convex version
-class ConvexSoftMixer(nn.Module):
-    def __init__(self, d_k, proj_dim, petals):
-        super().__init__()
-        self.score_q = ICNN(d_k, [d_k], petals)      # f(q)
-        self.score_k = ICNN(d_k, [d_k], petals)      # g(k)
-        self.lin_h   = nn.Linear(d_k, proj_dim, bias=False)
-        self.lin_v   = nn.Linear(d_k, proj_dim, bias=False)
+        # === 5. Weighted sum ==============================================
+        out = torch.einsum('bhij,bhjd->bhid', weight, v)            # (B,H,S,d_k)
+        return out
 
-    def forward(self, q, k, v):          # (B,H,S,d_k)
-        B,H,S,D = q.shape
-        f_q = self.score_q(q)            # (B,H,S)
-        g_k = self.score_k(k)            # (B,H,S)
 
-        # random‑feature kernel   exp(<q,k>) ≈ φ(q)·φ(k)
-        phi_q = torch.exp(self.lin_h(q))     # (B,H,S,r)
-        phi_k = torch.exp(self.lin_h(k))     # weight‑sharing ok
-        scores = torch.einsum('bhsr,bhtr->bhst', phi_q, phi_k)  # (B,H,S,S)
 
-        s_ij = f_q.unsqueeze(3) + g_k.unsqueeze(2) + scores.log()
-        # pre‑compute value feature
-        u_jd = self.lin_v(v)                             # (B,H,S,r)
-        logits = s_ij.unsqueeze(-1) + u_jd.unsqueeze(2)  # (B,H,S,S,r)
-        y = torch.logsumexp(logits, dim=3) - math.log(S) # (B,H,S,r)
-        return y  
-
+# ----------------------------------------------------------------------
+#   Pairwise Hull Attention (mask‑aware)
+# ----------------------------------------------------------------------
 class PairwiseHullAttention(nn.Module):
-    def __init__(self, embed_dim, heads, petals, inner_dim=128, use_s4d=False):
+    def __init__(self, embed_dim, heads, petals, use_s4d=False):
         super().__init__()
-        assert inner_dim % heads == 0
+        assert embed_dim % heads == 0, "embed_dim must be divisible by heads"
+        self.embed_dim = embed_dim
         self.heads = heads
-        self.d_k   = inner_dim // heads
+        self.d_k = embed_dim // heads
+        if use_s4d:
+            self.pre = S4PreMix(embed_dim, heads, petals, True)
+        else:
+            self.pre = LinearPreMix(embed_dim, heads, petals, False)
+        self.mixer = ConvexMixer(self.d_k, petals, self.d_k // 2)
+        self.pos = ConvexPositionalBias(heads)
+        self.W_O = nn.Linear(embed_dim, embed_dim, bias=False)
 
-        premix_cls = S4PreMix if use_s4d else LinearPreMix
-        self.pre   = premix_cls(embed_dim, inner_dim, heads, N_modes=64)
-        self.mixer = ConvexHullMixer(self.d_k)
-        self.pos   = ConvexPositionalBias(heads)
-        self.W_O   = nn.Linear(inner_dim, embed_dim)
-
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None):
-        # x    : (B,S,E)
-        # mask : (1|B,1|H,S,S) with True = keep
-        B, S, _ = x.shape
-        q, k, v = self.pre(x)                               # (B,H,S,d)
-
-        bias = self.pos(S).unsqueeze(0)                     # (1,H,S,S)
+    def forward(self, x, mask=None):
+        B, S, E = x.shape
+        q, k, v = self.pre(x)
+        bias = self.pos(S).unsqueeze(0)
         if mask is not None:
-            mask_bool = mask.to(torch.bool)
-            bias      = bias.masked_fill(~mask_bool, float('-inf'))
+            bias = bias.masked_fill(~mask, float('-inf'))
+        # pass bias as extra_score keyword
+        y = self.mixer(q, k, v, extra_score=bias)
+        y = y.transpose(1, 2).reshape(B, S, self.embed_dim)
+        return self.W_O(y)
 
-        y = self.mixer(q, k, v, extra_score=bias)           # (B,H,S,d)
-        out = y.transpose(1, 2).reshape(B, S, -1)           # (B,S,inner_dim)
-        return self.W_O(out)
-
+# ----------------------------------------------------------------------
+#   OmniHull Block
+# ----------------------------------------------------------------------
 class OmniHullBlock(nn.Module):
     def __init__(self, dim, heads, petals, use_s4d=False):
         super().__init__()
@@ -402,11 +407,14 @@ class OmniHullBlock(nn.Module):
         alpha = F.softplus(a_raw) / (1 + F.softplus(a_raw))
         return (1 - alpha) * x + alpha * y
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None):
+    def forward(self, x: torch.Tensor, mask = None):
         x = self._mix(x, self.attn(self.ln1(x), mask), self.a1)
         x = self._mix(x, self.hff(self.ln2(x)),         self.a2)
         return x
 
+# ----------------------------------------------------------------------
+#   GPT Wrapper with Causal Mask
+# ----------------------------------------------------------------------
 class ConvexGPT(nn.Module):
     def __init__(self, vocab_size: int, embed_dim: int, depth: int, heads: int, petals: int):
         super().__init__()
