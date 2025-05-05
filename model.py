@@ -11,22 +11,9 @@ from typing import List,Literal
 class SqSoftplus(nn.Module):
     def __init__(self):
         super().__init__()
-        #a better learned softplus that has a sigmoid which approximates the student-t which is closer to the guassian and between guassian and logistic cdf. kino!
-        B_raw_init = 0.9560222689178164
-        # store as a buffer so no grads and moves to GPU
-        self.register_buffer('B_raw', torch.tensor(B_raw_init, dtype=torch.float32))
-        # constant ln(2)
-        self.register_buffer('ln2', torch.log(torch.tensor(2.0)))
-
-    @property
-    def B(self):
-        return F.softplus(self.B_raw)
 
     def forward(self, x):
-        B = self.B                 # scalar tensor
-        # activation = [F(x) = x - 0.5/B*atan(Bx) + ln2]^2
-        F_x = x - 0.5/B * torch.atan(B * x) + self.ln2
-        return F_x.pow(2)
+        return F.softplus(x).pow(2)
 
         
 class S4DFFT(nn.Module):
