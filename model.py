@@ -5,8 +5,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from pathlib import Path
-from typing import List, Literal
+from typing import List,Literal
 
+
+class SqSoftplus(nn.Module):
+    def __init__(self):
+        super().__init__()
+        #a better learned softplus that has a sigmoid which approximates the student-t which is closer to the guassian and between guassian and logistic cdf. kino!
+        B_raw_init = 0.9560222689178164
+        # store as a buffer so no grads and moves to GPU
+        self.register_buffer('B_raw', torch.tensor(B_raw_init, dtype=torch.float32))
+        # constant ln(2)
+        self.register_buffer('ln2', torch.log(torch.tensor(2.0)))
+
+    @property
+    def B(self):
+        return F.softplus(self.B_raw)
+
+    def forward(self, x):
+        B = self.B                 # scalar tensor
+        # activation = [F(x) = x - 0.5/B*atan(Bx) + ln2]^2
+        F_x = x - 0.5/B * torch.atan(B * x) + self.ln2
+        return F_x.pow(2)
+
+        
 class S4DFFT(nn.Module):
     """
     Diagonal State‑Space (S4D) layer with length‑agnostic FFT or recurrent scan.
@@ -194,7 +216,7 @@ class PositiveLinear(nn.Module):
 
     @property
     def weight(self):                        # strictly positive
-        return F.softplus(self.raw)
+        return F.softplus(self.raw).pow(2)
 
     def forward(self, x):
         return F.linear(x, self.weight, self.bias)
@@ -206,7 +228,7 @@ class ICNN(nn.Module):
         layers = [PositiveLinear(dim if i==0 else h, h) for i, h in enumerate(hidden_dims)]
         layers.append(PositiveLinear(hidden_dims[-1], dim))        # keep dimension
         self.layers = nn.ModuleList(layers)
-        self.softplus = nn.Softplus()
+        self.softplus = SqSoftplus()
 
     def forward(self, x):                                          # (..., D)
         z = x
@@ -222,7 +244,7 @@ class ConvexGate(nn.Module):
     def __init__(self, in_dim: int):
         super().__init__()
         self.lin = nn.Linear(in_dim, 1, bias=True)
-        self.softplus = nn.Softplus()
+        self.softplus = SqSoftplus()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         u = self.softplus(self.lin(x))      # convex, ≥ 0
@@ -230,40 +252,67 @@ class ConvexGate(nn.Module):
 
 class ScalarHull(nn.Module):
     """
-    Scalar-valued convex hull with a bounded convex gate.
-      x : (..., D)  ->  y : (...,)     (scalar output)
+    Scalar‐valued convex hull with a bounded convex gate,
+    where the LSE temperature is τ = sqrt(‖xg‖² + ν),
+    yielding a Student-t taper.
+      x : (..., D)  →  y : (...,)   (scalar output)
     """
-    def __init__(self, in_dim: int, hidden: List[int], petals: int):
+    def __init__(self, in_dim: int, hidden_dims: List[int], petals: int):
         super().__init__()
-        # convex ICNN petals
-        self.petals = nn.ModuleList(ICNN(in_dim, hidden) for _ in range(petals))
-        # convex & bounded gate
-        self.gate   = ConvexGate(in_dim)
+        self.nu = 2.71828
+        # each petal is a genuine ICNN: R^D→R^D→R
+        self.petals = nn.ModuleList(ICNN(in_dim, hidden_dims) for _ in range(petals))
+        # convex & bounded gate: g(x) ∈ (0,1)
+        self.gate = ConvexGate(in_dim)
+        self.eps  = 1e-6
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        g      = self.gate(x)                                          # (...,1)
-        xg = (x + torch.randn_like(x) * 1e-6) * g                      # (...,D)
-        scores = [p(xg).mean(-1, keepdim=True) for p in self.petals]    # list of (...,1)
-        return torch.logsumexp(torch.cat(scores, dim=-1), dim=-1)      # (...,)
+        # x: (..., D)
+        g   = self.gate(x)                                   # (..., 1)
+        xg  = (x + torch.randn_like(x) * self.eps) * g       # (..., D)
+        # 1) magnitude per example: r = sqrt(mean(xg_i²))
+        r   = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)  # (..., 1)
+        # 2) temperature τ = sqrt(r² + ν)
+        tau = torch.sqrt(r.pow(2) + self.nu)                 # (..., 1)
+        # 3) compute each petal’s scalar score (mean over features)
+        scores = [petal(xg).mean(dim=-1, keepdim=True) for petal in self.petals]  # list of (...,1)
+        S      = torch.cat(scores, dim=-1)                   # (..., P)
+        # 4) tempered log-sum-exp and rescale: out = (1/τ)·logsumexp(τ·S)
+        lse = torch.logsumexp(S * tau, dim=-1, keepdim=True) # (..., 1)
+        out = lse / tau                                       # (..., 1)
+        return out.squeeze(-1)                                # (...,)
+
 
 class VectorHull(nn.Module):
     """
-    Vector-valued convex hull with a bounded convex gate.
-      x : (..., D)  ->  y : (..., D)
+    Vector‐valued convex hull with a bounded convex gate,
+    where the LSE temperature is τ = sqrt(‖xg‖² + ν),
+    yielding a Student-t taper.
+      x : (..., D)  →  y : (..., D)
     """
-    def __init__(self, dim: int, hidden: List[int], petals: int):
+    def __init__(self, dim: int, hidden_dims: List[int], petals: int):
         super().__init__()
-        # convex ICNN petals
-        self.petals = nn.ModuleList(ICNN(dim, hidden) for _ in range(petals))
-        # convex & bounded gate
+        self.nu = 2.71828
+        self.petals = nn.ModuleList(ICNN(dim, hidden_dims) for _ in range(petals))
         self.gate   = ConvexGate(dim)
+        self.eps    = 1e-6
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        g    = self.gate(x)                                           # (...,1)
-        xg = (x + torch.randn_like(x) * 1e-6) * g                      # (...,D)
-        outs = torch.stack([p(xg) for p in self.petals], dim=-1)      # (...,D,P)
-        return torch.logsumexp(outs, dim=-1)                         # (...,D)
-
+        # x: (..., D)
+        g    = self.gate(x)                                # (..., 1)
+        xg   = (x + torch.randn_like(x) * self.eps) * g    # (..., D)
+        # 1) magnitude per token: r = sqrt(mean(xg_i²))
+        r    = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)  # (..., 1)
+        # 2) temperature τ = sqrt(r² + ν)
+        tau  = torch.sqrt(r.pow(2) + self.nu)              # (..., 1)
+        # 3) get all petal outputs: shape (..., D, P)
+        outs = torch.stack([petal(xg) for petal in self.petals], dim=-1)  # (..., D, P)
+        # 4) tempered LSE per feature: out_j = (1/τ)·logsumexp(τ·outs_j)
+        scaled = outs * tau.unsqueeze(-2)                  # (..., D, P)
+        lse    = torch.logsumexp(scaled, dim=-1)           # (..., D)
+        out    = lse / tau                                 # (..., D)
+        return out
+        
 class ValueICNN(nn.Module):
     """
     Produce a vector-valued value embedding via a convex ICNN hull.
@@ -289,7 +338,7 @@ class ConvexPositionalBias(nn.Module):
     def __init__(self, heads):
         super().__init__()
         self.w_raw = nn.Parameter(torch.zeros(heads))   # raw parameter
-        self.softplus = nn.Softplus()
+        self.softplus = SqSoftplus()
 
     def forward(self, S: int):
         device = self.w_raw.device
@@ -312,20 +361,11 @@ class ConvexMixer(nn.Module):
 
     def __init__(self, d_k: int, petals: int, r: int):
         super().__init__()
-        self.temperature = torch.tensor(1.0 / math.sqrt(d_k))
-        # convex, per‑token scalar scores
-        from typing import List
-        class ScalarHull(nn.Module):
-            def __init__(self, d: int, hidden: List[int], petals: int):
-                super().__init__()
-                self.petals = nn.ModuleList([nn.Sequential(nn.Linear(d, h), nn.Softplus(), nn.Linear(h, 1)) for h in hidden for _ in range(petals)])
-            def forward(self, x):  # (..., d)
-                outs = torch.stack([p(x) for p in self.petals], dim=-1).squeeze(-2)  # (..., P)
-                return torch.logsumexp(outs, dim=-1)  # (...,)
+        self.register_buffer('temperature', torch.tensor(1.0 / math.sqrt(d_k)))
 
         self.score_q = ScalarHull(d_k, [d_k], petals)
         self.score_k = ScalarHull(d_k, [d_k], petals)
-
+        self.gate = SqSoftplus()
         # non‑negative random‑feature maps
         self.lin_h_q = nn.Linear(d_k, r, bias=False)
         self.lin_h_k = nn.Linear(d_k, r, bias=False)
@@ -342,8 +382,8 @@ class ConvexMixer(nn.Module):
         # use softplus to guarantee positivity but cap the raw values before exp
         raw_phi_q = self.lin_h_q(q).clamp(max=20.0)
         raw_phi_k = self.lin_h_k(k).clamp(max=20.0)
-        phi_q = F.softplus(raw_phi_q)      # (B,H,S,r)
-        phi_k = F.softplus(raw_phi_k)       # (B,H,S,r)
+        phi_q = self.gate(raw_phi_q)      # (B,H,S,r)
+        phi_k = self.gate(raw_phi_k)       # (B,H,S,r)
         # Instead of einsum…
         # kernel = torch.einsum('bhsr,bhtr->bhst', phi_q, phi_k) + 1e-6
         
@@ -384,7 +424,7 @@ class InterleavedPhaseChannelizer(nn.Module):
         self.M = embed_dim // 2
         # one raw gate per channel
         self.gate_raw = nn.Parameter(torch.full((self.M,), init_gate_bias))
-        self.softplus = nn.Softplus()
+        self.softplus = SqSoftplus()
 
     def forward(self,
                 x: torch.Tensor,   # (B, T, 2*M)
@@ -551,6 +591,8 @@ class ConvexGPT(nn.Module):
         x = self.ln_f(x)                             # (B, S, embed_dim)
         logits = self.head(x)                        # (B, S, vocab_size)
         return logits
+
+
 
 
 #training,eval loop 
