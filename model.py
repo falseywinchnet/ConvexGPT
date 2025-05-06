@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import List,Literal
 
 
-
 class SqSoftplus(nn.Module):
     def __init__(self):
         super().__init__()
@@ -141,7 +140,7 @@ class S4DFFT(nn.Module):
         return self.out_proj(y)
 
 class S4PreMix(nn.Module):
-    def __init__(self, embed_dim: int, heads: int, petals: int):
+    def __init__(self, embed_dim: int, heads: int):
         super().__init__()
         # compute per-head and inner dimensions
         assert embed_dim % heads == 0, "embed_dim must be divisible by heads"
@@ -173,7 +172,7 @@ class S4PreMix(nn.Module):
         return q, k, v
 
 class LinearPreMix(nn.Module):
-    def __init__(self, embed_dim: int, heads: int, petals: int):
+    def __init__(self, embed_dim: int, heads: int):
         super().__init__()
         assert embed_dim % heads == 0, "embed_dim must be divisible by heads"
         self.heads = heads
@@ -191,46 +190,6 @@ class LinearPreMix(nn.Module):
         v = v.view(B, S, self.heads, self.d_k).transpose(1,2)
         return q, k, v
 
-class MoePreMix(nn.Module):
-    def __init__(self, embed_dim: int, heads: int, petals: int):
-        super().__init__()
-        assert embed_dim % heads == 0, "embed_dim must be divisible by heads"
-        self.heads = heads
-        self.d_k = embed_dim // heads
-
-        # linear projection for Q and K
-        self.qk_proj = nn.Linear(embed_dim, 2 * embed_dim, bias=False)
-
-        # one VectorHull expert per head for V
-        self.value_hulls = nn.ModuleList([
-            VectorHull(self.d_k, [self.d_k], petals)
-            for _ in range(heads)
-        ])
-
-    def forward(self, x: torch.Tensor):
-        # x: (B, S, E)
-        B, S, E = x.shape
-        H, D = self.heads, self.d_k
-
-        # Q,K projection
-        qk = self.qk_proj(x)                    # (B, S, 2*E)
-        q, k = qk.chunk(2, dim=-1)
-        q = q.view(B, S, H, D).transpose(1, 2)  # (B, H, S, D)
-        k = k.view(B, S, H, D).transpose(1, 2)
-
-        # Value via per-head hulls
-        # reshape to heads
-        x_heads = x.view(B, S, H, D).transpose(1, 2)  # (B, H, S, D)
-        v_heads = []
-        for h, hull in enumerate(self.value_hulls):
-            flat = x_heads[:, h, :, :].reshape(-1, D)
-            v_flat = hull(flat)
-            v_h = v_flat.view(B, S, D)
-            v_heads.append(v_h)
-        # stack back into (B, H, S, D)
-        v = torch.stack(v_heads, dim=1)
-    
-        return q, k, v
 
 # ----------  Positive weight layer with Hoedt–Klambauer init ----------
 # ---------------------------------------------------------------------
@@ -274,6 +233,10 @@ class BatchedICNN(nn.Module):
             self.W_raw.append(w)
             self.bias.append(b)
         self.act = SqSoftplus()
+        self.W_y = nn.ParameterList()
+        for d_out in dims[1:]:
+                w_y = nn.Parameter(torch.randn(petals, d_out, in_dim) * 0.1)
+                self.W_y.append(w_y)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -290,24 +253,27 @@ class BatchedICNN(nn.Module):
         
         # Duplicate input for each petal
         x_petals = x_flat.unsqueeze(1).expand(batch_size, self.P, D_in)  # (N, P, D_in)
-        
+        x_input = x_flat.unsqueeze(1).expand(batch_size, self.P, D_in)  # (N, P, D_in)
+
         # Apply each layer
-        for W_raw, bias in zip(self.W_raw, self.bias):
+        for W_raw, W_y, bias in zip(self.W_raw, self.W_y, self.bias):
             # Process all petals at once using einsum
             # x_petals: (N, P, D_in), W_raw: (P, D_out, D_in) -> (N, P, D_out)
             x_petals = torch.einsum('npi,poj->npo', x_petals, W_raw)
-            
+            z_input  = torch.einsum('npi,poj->npo', x_input,  W_y) #add residuals
+
             # Add bias
-            x_petals = x_petals + bias.unsqueeze(0)  # bias: (P, D_out) -> (1, P, D_out)
+            z_product = z_input + x_petals + bias.unsqueeze(0)  # bias: (P, D_out) -> (1, P, D_out)
             
             # Apply activation
-            x_petals = self.act(x_petals)
+            x_petals = self.act(z_product)
         
         # Reshape to original dimensions + petal dimension
         output_shape = orig_shape[:-1] + (self.P, x_petals.size(-1))
         return x_petals.reshape(output_shape)
 
-# ---------------- ICNN petal -----------------------------------------
+'''
+# ---------------- ICNN petal basic mandatory characteristics -----------------------------------------
 class ICNN(nn.Module):
     def __init__(self, dim, hidden_dims):
         super().__init__()
@@ -321,7 +287,7 @@ class ICNN(nn.Module):
         for layer in self.layers:
             z = self.softplus(layer(z))
         return z
-
+'''
 
 class ConvexGate(nn.Module):
     """
@@ -340,14 +306,22 @@ class ScalarHull(nn.Module):
     def __init__(self, in_dim: int, hidden_dims: List[int], petals: int):
         super().__init__()
         self.register_buffer('nu',  torch.log(torch.tensor(2.71828)))
-        self.register_buffer('eps', torch.tensor(1e-6))
+        self.register_buffer('noise_scale', torch.tensor(1e-5))
         self.petals = BatchedICNN(in_dim, hidden_dims, petals)
         self.gate   = ConvexGate(in_dim)
+        self.register_buffer("creative", torch.tensor(True))
+        self.register_buffer('eps', torch.tensor(1e-6))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (..., D)
         g   = self.gate(x)                                   # (..., 1)
-        xg  = (x + torch.randn_like(x) * self.eps) * g       # (..., D)
+
+        #creativity toggle here
+
+        if self.creative:
+            xg   = (x + torch.randn_like(x) * self.noise_scale) * g # (..., D)
+        else:
+            xg   = x  * g # (..., D)
 
         # compute τ
         r   = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)  # (..., 1)
@@ -369,14 +343,21 @@ class VectorHull(nn.Module):
     def __init__(self, dim: int, hidden_dims: List[int], petals: int):
         super().__init__()
         self.register_buffer('nu',  torch.log(torch.tensor(2.71828)))
-        self.register_buffer('eps', torch.tensor(1e-6))
+        self.register_buffer('noise_scale', torch.tensor(1e-5))
         self.petals = BatchedICNN(dim, hidden_dims, petals)
         self.gate   = ConvexGate(dim)
+        self.register_buffer("creative", torch.tensor(True))
+        self.register_buffer('eps', torch.tensor(1e-6))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (..., D)
         g    = self.gate(x)                             # (..., 1)
-        xg   = (x + torch.randn_like(x) * self.eps) * g # (..., D)
+
+        #creativity toggle here
+        if self.creative:
+            xg   = (x + torch.randn_like(x) * self.noise_scale) * g # (..., D)
+        else:
+            xg   = x  * g # (..., D)
 
         # compute τ
         r    = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)  # (..., 1)
@@ -395,22 +376,6 @@ class VectorHull(nn.Module):
         # divide by τ (still shape (...,1)), broadcasts to (...,D)
         return lse / tau                         # (..., D)
         
-class ValueICNN(nn.Module):
-    """
-    Produce a vector-valued value embedding via a convex ICNN hull.
-      x : (..., embed_dim) -> v : (..., embed_dim)
-    """
-    def __init__(self, embed_dim: int, hidden_dims: List[int], petals: int):
-        super().__init__()
-        # a VectorHull already returns a vector of same dim
-        self.vh = VectorHull(embed_dim, hidden_dims, petals)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, S, E)
-        B, S, E = x.shape
-        # flatten tokens, run through hull, then restore shape
-        v = self.vh(x.reshape(-1, E))    # (B*S, E)
-        return v.view(B, S, E)
 
 class ConvexPositionalBias(nn.Module):
     """
@@ -441,12 +406,14 @@ class ConvexMixer(nn.Module):
         super().__init__()
         self.register_buffer('nu',  torch.tensor(2.71828))
         self.register_buffer('eps', torch.tensor(1e-6))
+        self.register_buffer('noise_scale', torch.tensor(1e-5))
 
-        self.score_q = ScalarHull(d_k, [d_k], petals)
-        self.score_k = ScalarHull(d_k, [d_k], petals)
+        self.score_q = ScalarHull(d_k, [d_k*2,d_k//2], petals)
+        self.score_k = ScalarHull(d_k, [d_k*2,d_k//2], petals)
         self.gate     = SqSoftplus()
         self.lin_h_q  = nn.Linear(d_k, r, bias=False)
         self.lin_h_k  = nn.Linear(d_k, r, bias=False)
+        self.register_buffer("creative", torch.tensor(True))
 
     def forward(self,
                 q: torch.Tensor,            # (B,H,S,d_k)
@@ -460,7 +427,13 @@ class ConvexMixer(nn.Module):
 
         # 1) Compute data-dependent tau
         gate_q = self.gate(q)
-        q_pert = (q + torch.randn_like(q) * self.eps) * gate_q
+
+        #creativity toggle here
+        if self.creative:
+            q_pert = (q + torch.randn_like(q) * self.noise_scale) * gate_q
+        else:
+            q_pert = q  * gate_q
+
         rms    = torch.sqrt((q_pert**2).mean(-1, keepdim=True) + self.eps)
         tau    = torch.sqrt(rms**2 + self.nu)  # (B,H,S,1)
 
@@ -468,10 +441,27 @@ class ConvexMixer(nn.Module):
         fq = self.score_q(q)  # (B,H,S)
         gk = self.score_k(k)  # (B,H,S)
 
+        #creativity toggle here
+        if self.creative:
+
+            # Perturb and re-score
+            q_noise = (torch.rand_like(q) - 0.5) * self.noise_scale
+            k_noise = (torch.rand_like(k) - 0.5) * self.noise_scale
+            fq_pert = self.score_q(q + q_noise)   # (B,H,S)
+            gk_pert = self.score_k(k + k_noise)   # (B,H,S)
+            
+            # Regret signal: how much scores changed under noise
+            delta_fq = (fq_pert - fq).detach()
+            delta_gk = (gk_pert - gk).detach()
+            
+            # Shape original score to prefer regret-stable regions
+            fq = fq - delta_fq * 0.1
+            gk = gk - delta_gk * 0.1
+
         # 3) Random-feature kernel in log-space
         phi_q   = self.gate(self.lin_h_q(q).clamp(max=20.0))
         phi_k   = self.gate(self.lin_h_k(k).clamp(max=20.0))
-        kernel  = torch.matmul(phi_q, phi_k.transpose(-1,-2)) + 1e-6
+        kernel  = torch.matmul(phi_q, phi_k.transpose(-1,-2)) + self.eps
         logK    = kernel.log()  # (B,H,S,S)
 
         # 4) Build and mask scores
@@ -564,22 +554,22 @@ class InterleavedPhaseChannelizer(nn.Module):
 #   Pairwise Hull Attention (mask‑aware)
 # ----------------------------------------------------------------------
 class PairwiseHullAttention(nn.Module):
-    def __init__(self, embed_dim, heads, petals, use):
+    def __init__(self, embed_dim, heads, use):
         super().__init__()
         assert embed_dim % heads == 0, "embed_dim must be divisible by heads"
         self.embed_dim = embed_dim
         self.heads = heads
         self.d_k = embed_dim // heads
         if use==0:
-            self.pre = S4PreMix(embed_dim, heads, petals)
-        elif use==1:
-            self.pre = LinearPreMix(embed_dim, heads, petals)
-        elif use==2:
-            self.pre = MoePreMix(embed_dim, heads, petals)
-        self.mixer = ConvexMixer(self.d_k, petals, self.d_k*2)
+            self.pre = S4PreMix(embed_dim, heads)
+        else:
+            self.pre = LinearPreMix(embed_dim, heads)
+        self.mixer = ConvexMixer(self.d_k, min(1 + self.d_k // 16, 8), self.d_k*2)#dont need many for scoring
         self.pos = ConvexPositionalBias(heads)
         self.W_O = nn.Linear(embed_dim, embed_dim, bias=False)
         self.phase = InterleavedPhaseChannelizer(embed_dim)
+        self.register_buffer('noise_scale', torch.tensor(1e-5))
+        self.register_buffer("creative", torch.tensor(True))
 
     def forward(self, x, mask=None):
         x = self.phase(x,mask)
@@ -594,8 +584,25 @@ class PairwiseHullAttention(nn.Module):
         if mask is not None:
             bias = bias.masked_fill(~mask, float('-inf'))
         # pass bias as extra_score keyword
-        y = self.mixer(Q, K, V, extra_score=bias,mask=mask)
 
+        #creativity toggle here
+        if self.creative:
+            n_q = (torch.rand_like(Q) - 0.5) * self.noise_scale
+            n_k = (torch.rand_like(K) - 0.5) * self.noise_scale
+            n_v = (torch.rand_like(V) - 0.5) * self.noise_scale
+            
+            Q_pos, K_pos, V_pos = Q + n_q, K + n_k, V + n_v
+            Q_neg, K_neg, V_neg = Q - n_q, K - n_k, V - n_v
+            
+            # compute attention both ways
+            y_pos = self.mixer(Q_pos, K_pos, V_pos, extra_score=bias, mask=mask)
+            y_neg = self.mixer(Q_neg, K_neg, V_neg, extra_score=bias, mask=mask)
+            
+            # average
+            y = 0.5 * (y_pos + y_neg)
+        else:
+            y = self.mixer(Q, K, V, extra_score=bias, mask=mask)
+        
         y = y.transpose(1, 2).reshape(B, S, self.embed_dim)
         return self.W_O(y)
 
@@ -606,10 +613,10 @@ class PairwiseHullAttention(nn.Module):
 #   OmniHull Block
 # ----------------------------------------------------------------------
 class OmniHullBlock(nn.Module):
-    def __init__(self, dim, heads, petals, use=0):
+    def __init__(self, dim, heads, moe_petals, use=0):
         super().__init__()
-        self.attn = PairwiseHullAttention(dim, heads, petals, use=use)
-        self.hff  = VectorHull(dim, [dim * 2], petals)
+        self.attn = PairwiseHullAttention(dim, heads, use=use)
+        self.hff  = VectorHull(dim, [dim * 2,dim//2], petals=moe_petals)
         self.ln1, self.ln2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
         self.a1, self.a2   = nn.Parameter(torch.zeros(())), nn.Parameter(torch.zeros(()))
 
@@ -633,7 +640,8 @@ class ConvexGPT(nn.Module):
         embed_dim: int,
         depth: int,
         heads: int,
-        petals: int
+        moe_petals: int,
+        creativity: bool = True
     ):
         super().__init__()
         assert embed_dim >= 1, "embed_channels must be ≥1"
@@ -648,7 +656,7 @@ class ConvexGPT(nn.Module):
             OmniHullBlock(
                 self.embed_dim,
                 heads,
-                petals,
+                moe_petals,
                 use=(i % 2 if i < depth - 1 else 0)  # force last block to be linear
             )
             for i in range(depth)
@@ -656,12 +664,22 @@ class ConvexGPT(nn.Module):
 
         self.ln_f = nn.LayerNorm(self.embed_dim)
         self.head = nn.Linear(self.embed_dim, vocab_size, bias=False)
+        self.set_creativity(creativity)
 
     @staticmethod
     def _causal_mask(S: int, device: torch.device) -> torch.Tensor:
         # shape (1, 1, S, S) where True = allowed
         return torch.tril(torch.ones(S, S, dtype=torch.bool, device=device)) \
                    .unsqueeze(0).unsqueeze(1)
+
+    def set_creativity(self, value: bool):
+        val = torch.tensor(value)
+        def recurse(m):
+            if hasattr(m, "creative"):
+                m.creative.copy_(val)
+            for child in m.children():
+                recurse(child)
+        recurse(self)
 
     def forward(self, idx: torch.Tensor):
         """
@@ -690,6 +708,8 @@ class ConvexGPT(nn.Module):
         x = self.ln_f(x)                             # (B, S, embed_dim)
         logits = self.head(x)                        # (B, S, vocab_size)
         return logits
+
+
 
 
 
