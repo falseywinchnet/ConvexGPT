@@ -8,6 +8,14 @@ from pathlib import Path
 from typing import List,Literal
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from pathlib import Path
+from typing import List,Literal
+
+
 
         
 class S4DFFT(nn.Module):
@@ -203,20 +211,206 @@ class PositiveLinear(nn.Module):
         return F.linear(x, self.weight, self.bias)
 
 '''   
-#The methods in this commented section are not efficient.
-#However, they represent underlying design direction intent and are thusly preserved for posterity.
-#Perhaps future hardware will make their utilization more practical.
+#note: this will do it faster but will use more memory.
+class BatchedICNN(nn.Module):
+    """
+    Fully vectorized BatchedICNN: supports arbitrary input dimensions.
+    Input:  x of shape (..., D_in)
+    Output: tensor of shape (..., P, D_out_last)
 
-class SqSoftplus(nn.Module):
-    def __init__(self):
+    """
+    def __init__(self, in_dim: int, hidden_dims: list, petals: int):
         super().__init__()
-    "student-t cdf loving sigmoid. a bit harder cutoff, closer to relu, really"
-    def forward(self, x):
-        b, c, a = 2.048054698846035487304997, 0.841470984807896,0.45339765151640376764474
-        t1 = F.softplus(b * x) /b 
-        t2 = F.softplus(c * x) / c
-        return ((1-a) * t1 + a * t2).pow(2) 
+        self.P = petals
+        dims = [in_dim] + hidden_dims + [in_dim]
+        # ParameterList for each layer's weights and biases
+        self.W_raw = nn.ParameterList()
+        self.bias = nn.ParameterList()
+        for d_in, d_out in zip(dims[:-1], dims[1:]):
+            w = nn.Parameter(
+                torch.randn(petals, d_out, d_in) * 0.2 + math.log(math.sqrt(2.0 / d_in))
+            )
+            b = nn.Parameter(torch.zeros(petals, d_out))
+            self.W_raw.append(w)
+            self.bias.append(b)
+        self.act = nn.Softplus()
+      
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (..., D_in) → y: (..., P, D_out_last)
+        Supports arbitrary input dimensions efficiently.
+        """
+        # Save original shape and dimensions
+        orig_shape = x.shape
+        D_in = orig_shape[-1]
+        
+        # Flatten batch dimensions
+        x_flat = x.reshape(-1, D_in)             # (N, D_in)
+        batch_size = x_flat.size(0)
+        
+        # Duplicate input for each petal
+        x_petals = x_flat.unsqueeze(1).expand(batch_size, self.P, D_in)  # (N, P, D_in)
+        x_input = x_flat.unsqueeze(1).expand(batch_size, self.P, D_in)  # (N, P, D_in)
 
+        # Apply each layer
+        for W_raw, W_y, bias in zip(self.W_raw, self.W_y, self.bias):
+            # Process all petals at once using einsum
+            # x_petals: (N, P, D_in), W_raw: (P, D_out, D_in) -> (N, P, D_out)
+            x_petals = torch.einsum('npi,poj->npo', x_petals, W_raw)
+
+            x_petals.add_(bias.unsqueeze(0))              # in-place bias add
+            x_petals = self.act(x_petals)                 # result goes back into x_petals
+        
+        # Reshape to original dimensions + petal dimension
+        output_shape = orig_shape[:-1] + (self.P, x_petals.size(-1))
+        return x_petals.reshape(output_shape)
+
+'''
+
+class ICNN(nn.Module):
+    def __init__(self, in_dim: int, hidden_dims: list):
+        super().__init__()
+        dims = [in_dim] + hidden_dims + [in_dim]
+        self.layers = nn.ModuleList([
+            PositiveLinear(dims[i], dims[i+1]) for i in range(len(dims)-1)
+        ])
+        self.softplus = nn.Softplus()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = x
+        for layer in self.layers:
+            z = self.softplus(layer(z))
+        return z
+
+class MultiPetalICNN(nn.Module):
+    def __init__(self, in_dim, hidden_dims, petals):
+        super().__init__()
+        self.petals = nn.ModuleList([
+            ICNN(in_dim, hidden_dims) for _ in range(petals)
+        ])
+        self.W_y = nn.ParameterList([
+            nn.Parameter(torch.randn(in_dim, in_dim) * 0.1) for _ in range(petals)
+        ])
+        self.bias = nn.ParameterList([
+            nn.Parameter(torch.zeros(in_dim)) for _ in range(petals)
+        ])
+        self.act = nn.Softplus()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+      out = []
+      for icnn, b in zip(self.petals, self.bias):
+          z = icnn(x)
+          out.append(self.act(z + b)) #no residual bias allowed in this model.
+
+      return torch.stack(out, dim=-2)
+
+        
+
+class ConvexGate(nn.Module):
+    """
+    Convex & bounded gate: g(x) = 1 - exp(-softplus(Wx + b)) ∈ (0,1)
+    """
+    def __init__(self, in_dim: int):
+        super().__init__()
+        self.lin = nn.Linear(in_dim, 1, bias=True)
+        self.softplus = nn.Softplus()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        u = self.softplus(self.lin(x))      # convex, ≥ 0
+        return 1.0 - torch.exp(-u)       # convex, ∈ (0,1)
+
+class ScalarHull(nn.Module):
+    def __init__(self, in_dim: int, hidden_dims: List[int], petals: int):
+        super().__init__()
+        self.register_buffer('nu',  torch.log(torch.tensor(2.71828)))
+        self.register_buffer('noise_scale', torch.tensor(1e-5))
+        self.petals = MultiPetalICNN(in_dim, hidden_dims, petals)
+        self.gate   = ConvexGate(in_dim)
+        self.register_buffer("creative", torch.tensor(True))
+        self.register_buffer('eps', torch.tensor(1e-6))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (..., D)
+        g   = self.gate(x)                                   # (..., 1)
+
+        #creativity toggle here
+
+        if self.creative:
+            xg   = (x + torch.randn_like(x) * self.noise_scale) * g # (..., D)
+        else:
+            xg   = x  * g # (..., D)
+
+        # compute τ
+        r   = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)  # (..., 1)
+        tau = torch.sqrt(r.pow(2) + self.nu)                               # (..., 1)
+
+        # get each petal’s vector output, then reduce to scalar per petal
+        out_all = self.petals(xg)                  # (..., P, D)
+        scores  = out_all.mean(dim=-1)             # (..., P)
+
+        # tempered LSE over petals
+        # scaled: (..., P) = scores * τ
+        scaled = scores * tau                     # broadcasts τ→[...,1]→[...,P]
+        lse    = torch.logsumexp(scaled, dim=-1, keepdim=True)  # (..., 1)
+
+        # divide by τ and squeeze
+        return (lse / tau).squeeze(-1)             # (...,)
+
+class VectorHull(nn.Module):
+    def __init__(self, dim: int, hidden_dims: List[int], petals: int):
+        super().__init__()
+        self.register_buffer('nu',  torch.log(torch.tensor(2.71828)))
+        self.register_buffer('noise_scale', torch.tensor(1e-5))
+        self.petals = MultiPetalICNN(dim, hidden_dims, petals)
+        self.gate   = ConvexGate(dim)
+        self.register_buffer("creative", torch.tensor(True))
+        self.register_buffer('eps', torch.tensor(1e-6))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (..., D)
+        g    = self.gate(x)                             # (..., 1)
+
+        #creativity toggle here
+        if self.creative:
+            xg   = (x + torch.randn_like(x) * self.noise_scale) * g # (..., D)
+        else:
+            xg   = x  * g # (..., D)
+
+        # compute τ
+        r    = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)  # (..., 1)
+        tau  = torch.sqrt(r.pow(2) + self.nu)                              # (..., 1)
+
+        # batched petals → one vector per petal
+        out_all = self.petals(xg)                # (..., P, D)
+
+        # tempered LSE per feature: multiply each petal-vector by τ
+        # tau.unsqueeze(-1): (..., 1, 1) → broadcasts to (..., P, D)
+        scaled = out_all * tau.unsqueeze(-1)     
+
+        # collapse petal axis = -2
+        lse    = torch.logsumexp(scaled, dim=-2) # (..., D)
+
+        # divide by τ (still shape (...,1)), broadcasts to (...,D)
+        return lse / tau                         # (..., D)
+
+class ConvexPositionalBias(nn.Module):
+    """
+    Bias(i,j) = - w * |i-j|    with   w ≥ 0  (learned per head)
+    Convex in positional indices; monotone non‑increasing with distance.
+    """
+    def __init__(self, heads):
+        super().__init__()
+        self.w_raw = nn.Parameter(torch.zeros(heads))   # raw parameter
+        self.softplus = nn.Softplus()
+
+    def forward(self, S: int):
+        device = self.w_raw.device
+        w = self.softplus(self.w_raw)                      # (H,)
+        pos  = torch.arange(S, device=device, dtype=torch.float32)
+        dist = (pos.unsqueeze(0) - pos.unsqueeze(1)).abs()  # (S,S)
+        bias = - w[:, None, None] * dist                # (H,S,S)
+        return bias
+    
         
 class ConvexMixer(nn.Module):
     """
@@ -230,9 +424,9 @@ class ConvexMixer(nn.Module):
         self.register_buffer('eps', torch.tensor(1e-6))
         self.register_buffer('noise_scale', torch.tensor(1e-5))
 
-        self.score_q = ScalarHull(d_k, [d_k*2,d_k//2], petals)
-        self.score_k = ScalarHull(d_k, [d_k*2,d_k//2], petals)
-        self.gate     = SqSoftplus()
+        self.score_q = ScalarHull(d_k, [d_k*2], petals)
+        self.score_k = ScalarHull(d_k, [d_k*2], petals)
+        self.gate     = nn.Softplus()
         self.lin_h_q  = nn.Linear(d_k, r, bias=False)
         self.lin_h_k  = nn.Linear(d_k, r, bias=False)
         self.register_buffer("creative", torch.tensor(True))
@@ -251,10 +445,7 @@ class ConvexMixer(nn.Module):
         gate_q = self.gate(q)
 
         #creativity toggle here
-        if self.creative:
-            q_pert = (q + torch.randn_like(q) * self.noise_scale) * gate_q
-        else:
-            q_pert = q  * gate_q
+        q_pert = q  * gate_q
 
         rms    = torch.sqrt((q_pert**2).mean(-1, keepdim=True) + self.eps)
         tau    = torch.sqrt(rms**2 + self.nu)  # (B,H,S,1)
@@ -305,386 +496,6 @@ class ConvexMixer(nn.Module):
         shifted     = scaled - m_scaled
         lse         = m_scaled.squeeze(-2) + torch.logsumexp(shifted, dim=-2)
         out         = lse / tau                 # (B,H,S,D)
-
-        return out
-class ScalarHull(nn.Module):
-    def __init__(self, in_dim: int, hidden_dims: List[int], petals: int):
-        super().__init__()
-        self.register_buffer('nu',  torch.log(torch.tensor(2.71828)))
-        self.register_buffer('noise_scale', torch.tensor(1e-5))
-        self.petals = BatchedICNN(in_dim, hidden_dims, petals)
-        self.gate   = ConvexGate(in_dim)
-        self.register_buffer("creative", torch.tensor(True))
-        self.register_buffer('eps', torch.tensor(1e-6))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (..., D)
-        g   = self.gate(x)                                   # (..., 1)
-
-        #creativity toggle here
-
-        if self.creative:
-            xg   = (x + torch.randn_like(x) * self.noise_scale) * g # (..., D)
-        else:
-            xg   = x  * g # (..., D)
-
-        # compute τ
-        r   = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)  # (..., 1)
-        tau = torch.sqrt(r.pow(2) + self.nu)                               # (..., 1)
-
-        # get each petal’s vector output, then reduce to scalar per petal
-        out_all = self.petals(xg)                  # (..., P, D)
-        scores  = out_all.mean(dim=-1)             # (..., P)
-
-        # tempered LSE over petals
-        # scaled: (..., P) = scores * τ
-        scaled = scores * tau                     # broadcasts τ→[...,1]→[...,P]
-        lse    = torch.logsumexp(scaled, dim=-1, keepdim=True)  # (..., 1)
-
-        # divide by τ and squeeze
-        return (lse / tau).squeeze(-1)             # (...,)
-
-class VectorHull(nn.Module):
-    def __init__(self, dim: int, hidden_dims: List[int], petals: int):
-        super().__init__()
-        self.register_buffer('nu',  torch.log(torch.tensor(2.71828)))
-        self.register_buffer('noise_scale', torch.tensor(1e-5))
-        self.petals = BatchedICNN(dim, hidden_dims, petals)
-        self.gate   = ConvexGate(dim)
-        self.register_buffer("creative", torch.tensor(True))
-        self.register_buffer('eps', torch.tensor(1e-6))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (..., D)
-        g    = self.gate(x)                             # (..., 1)
-
-        #creativity toggle here
-        if self.creative:
-            xg   = (x + torch.randn_like(x) * self.noise_scale) * g # (..., D)
-        else:
-            xg   = x  * g # (..., D)
-
-        # compute τ
-        r    = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)  # (..., 1)
-        tau  = torch.sqrt(r.pow(2) + self.nu)                              # (..., 1)
-
-        # batched petals → one vector per petal
-        out_all = self.petals(xg)                # (..., P, D)
-
-        # tempered LSE per feature: multiply each petal-vector by τ
-        # tau.unsqueeze(-1): (..., 1, 1) → broadcasts to (..., P, D)
-        scaled = out_all * tau.unsqueeze(-1)     
-
-        # collapse petal axis = -2
-        lse    = torch.logsumexp(scaled, dim=-2) # (..., D)
-
-        # divide by τ (still shape (...,1)), broadcasts to (...,D)
-        return lse / tau                         # (..., D)
-
-
-        
-class BatchedICNN(nn.Module):
-    """
-    Fully vectorized BatchedICNN: supports arbitrary input dimensions.
-    Input:  x of shape (..., D_in)
-    Output: tensor of shape (..., P, D_out_last)
-    Uses all the memory
-    """
-    def __init__(self, in_dim: int, hidden_dims: list, petals: int):
-        super().__init__()
-        self.P = petals
-        dims = [in_dim] + hidden_dims + [in_dim]
-        # ParameterList for each layer's weights and biases
-        self.W_raw = nn.ParameterList()
-        self.bias = nn.ParameterList()
-        for d_in, d_out in zip(dims[:-1], dims[1:]):
-            w = nn.Parameter(
-                torch.randn(petals, d_out, d_in) * 0.2 + math.log(math.sqrt(2.0 / d_in))
-            )
-            b = nn.Parameter(torch.zeros(petals, d_out))
-            self.W_raw.append(w)
-            self.bias.append(b)
-        self.act = SqSoftplus()
-        self.W_y = nn.ParameterList()
-        for d_out in dims[1:]:
-                w_y = nn.Parameter(torch.randn(petals, d_out, in_dim) * 0.1)
-                self.W_y.append(w_y)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (..., D_in) → y: (..., P, D_out_last)
-        Supports arbitrary input dimensions efficiently.
-        """
-        # Save original shape and dimensions
-        orig_shape = x.shape
-        D_in = orig_shape[-1]
-        
-        # Flatten batch dimensions
-        x_flat = x.reshape(-1, D_in)             # (N, D_in)
-        batch_size = x_flat.size(0)
-        
-        # Duplicate input for each petal
-        x_petals = x_flat.unsqueeze(1).expand(batch_size, self.P, D_in)  # (N, P, D_in)
-        x_input = x_flat.unsqueeze(1).expand(batch_size, self.P, D_in)  # (N, P, D_in)
-
-        # Apply each layer
-        for W_raw, W_y, bias in zip(self.W_raw, self.W_y, self.bias):
-            # Process all petals at once using einsum
-            # x_petals: (N, P, D_in), W_raw: (P, D_out, D_in) -> (N, P, D_out)
-            x_petals = torch.einsum('npi,poj->npo', x_petals, W_raw)
-            z_input  = torch.einsum('npi,poj->npo', x_input,  W_y) #add residuals
-
-            z_input.add_(x_petals)                       # in-place accumulation
-            z_input.add_(bias.unsqueeze(0))              # in-place bias add
-            x_petals = self.act(z_input)                 # result goes back into x_petals
-        
-        # Reshape to original dimensions + petal dimension
-        output_shape = orig_shape[:-1] + (self.P, x_petals.size(-1))
-        return x_petals.reshape(output_shape)
-
-'''
-
-class ICNN(nn.Module):
-    def __init__(self, in_dim: int, hidden_dims: list):
-        super().__init__()
-        dims = [in_dim] + hidden_dims + [in_dim]
-        self.layers = nn.ModuleList([
-            PositiveLinear(dims[i], dims[i+1]) for i in range(len(dims)-1)
-        ])
-        self.softplus = nn.Softplus()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = x
-        for layer in self.layers:
-            z = self.softplus(layer(z))
-        return z
-
-class MultiPetalICNN(nn.Module):
-    def __init__(self, in_dim, hidden_dims, petals):
-        super().__init__()
-        self.petals = nn.ModuleList([
-            ICNN(in_dim, hidden_dims) for _ in range(petals)
-        ])
-        self.W_y = nn.ParameterList([
-            nn.Parameter(torch.randn(in_dim, in_dim) * 0.1) for _ in range(petals)
-        ])
-        self.bias = nn.ParameterList([
-            nn.Parameter(torch.zeros(in_dim)) for _ in range(petals)
-        ])
-        self.act = nn.Softplus()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-      out = []
-      for icnn, W_y, b in zip(self.petals, self.W_y, self.bias):
-          z = icnn(x)
-
-          # --- ensure type/device alignment ---
-          if W_y.dtype != x.dtype or W_y.device != x.device:
-              W_y = W_y.to(dtype=x.dtype, device=x.device)
-          if b.dtype != x.dtype or b.device != x.device:
-              b = b.to(dtype=x.dtype, device=x.device)
-
-          r = F.linear(x, W_y) + b
-          out.append(self.act(z + r))
-
-      return torch.stack(out, dim=-2)
-
-        
-
-class ConvexGate(nn.Module):
-    """
-    Convex & bounded gate: g(x) = 1 - exp(-softplus(Wx + b)) ∈ (0,1)
-    """
-    def __init__(self, in_dim: int):
-        super().__init__()
-        self.lin = nn.Linear(in_dim, 1, bias=True)
-        self.softplus = nn.Softplus()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        u = self.softplus(self.lin(x))      # convex, ≥ 0
-        return 1.0 - torch.exp(-u)       # convex, ∈ (0,1)
-
-class ScalarHull(nn.Module):
-    def __init__(self, in_dim: int, hidden_dims: List[int], petals: int):
-        super().__init__()
-        self.register_buffer('nu', torch.log(torch.tensor(2.71828)))
-        self.register_buffer('noise_scale', torch.tensor(1e-5))
-        self.petals = MultiPetalICNN(in_dim, hidden_dims, petals)
-        self.gate = ConvexGate(in_dim)
-        self.register_buffer("creative", torch.tensor(True))
-        self.register_buffer('eps', torch.tensor(1e-6))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        g = self.gate(x)  # (..., 1)
-
-        if self.creative:
-            noise = torch.randn_like(x) * self.noise_scale
-            xg = (x + noise) * g
-        else:
-            xg = x * g
-
-        r2 = xg.pow(2).mean(dim=-1, keepdim=True) + self.eps
-        tau = torch.sqrt(r2.pow(1) + self.nu)
-
-        out_all = self.petals(xg)  # (..., P, D)
-        scores = out_all.mean(dim=-1)  # (..., P)
-
-        scaled = scores * tau  # (..., P)
-        shift = scaled.max(dim=-1, keepdim=True).values
-        exp_scaled = torch.exp(scaled - shift)
-        weights = exp_scaled / exp_scaled.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-
-        return (weights * scores).sum(dim=-1)
-
-class VectorHull(nn.Module):
-    def __init__(self, dim: int, hidden_dims: List[int], petals: int):
-        super().__init__()
-        self.register_buffer('nu', torch.log(torch.tensor(2.71828)))
-        self.register_buffer('noise_scale', torch.tensor(1e-5))
-        self.petals = MultiPetalICNN(dim, hidden_dims, petals)
-        self.gate = ConvexGate(dim)
-        self.register_buffer("creative", torch.tensor(True))
-        self.register_buffer('eps', torch.tensor(1e-6))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        g = self.gate(x)
-
-        if self.creative:
-            noise = torch.randn_like(x) * self.noise_scale
-            xg = (x + noise) * g
-        else:
-            xg = x * g
-
-        r2 = xg.pow(2).mean(dim=-1, keepdim=True) + self.eps
-        tau = torch.sqrt(r2.pow(1) + self.nu)  # (..., 1)
-
-        out_all = self.petals(xg)  # (..., P, D)
-
-        scaled = out_all * tau.unsqueeze(-2)  # (..., P, D)
-        shift = scaled.max(dim=-2, keepdim=True).values
-        exp_scaled = torch.exp(scaled - shift)
-        weights = exp_scaled / exp_scaled.sum(dim=-2, keepdim=True).clamp(min=1e-6)
-
-        return (weights * out_all).sum(dim=-2)
-
-class ConvexPositionalBias(nn.Module):
-    """
-    Bias(i,j) = - w * |i-j|    with   w ≥ 0  (learned per head)
-    Convex in positional indices; monotone non‑increasing with distance.
-    """
-    def __init__(self, heads):
-        super().__init__()
-        self.w_raw = nn.Parameter(torch.zeros(heads))   # raw parameter
-        self.softplus = nn.Softplus()
-
-    def forward(self, S: int):
-        device = self.w_raw.device
-        w = self.softplus(self.w_raw)                      # (H,)
-        pos  = torch.arange(S, device=device, dtype=torch.float32)
-        dist = (pos.unsqueeze(0) - pos.unsqueeze(1)).abs()  # (S,S)
-        bias = - w[:, None, None] * dist                # (H,S,S)
-        return bias
-    
-        
-class ConvexMixer(nn.Module):
-    """
-    Convex, softmax-free attention via tempered log-sum-exp hull,
-    """
-
-    def __init__(self, d_k: int, petals: int, r: int):
-        super().__init__()
-        self.register_buffer('nu',  torch.tensor(2.71828))
-        self.register_buffer('eps', torch.tensor(1e-6))
-        self.register_buffer('noise_scale', torch.tensor(1e-5))
-
-        self.score_q = ScalarHull(d_k, [d_k*2,d_k//2], petals)
-        self.score_k = ScalarHull(d_k, [d_k*2,d_k//2], petals)
-        self.gate     = nn.Softplus()
-        self.lin_h_q  = nn.Linear(d_k, r, bias=False)
-        self.lin_h_k  = nn.Linear(d_k, r, bias=False)
-        self.register_buffer("creative", torch.tensor(True))
-
-    def forward(self,
-                q: torch.Tensor,            # (B,H,S,d_k)
-                k: torch.Tensor,            # (B,H,S,d_k)
-                v: torch.Tensor,            # (B,H,S,d_k)
-                extra_score: torch.Tensor,  # (B,H,S,S), finite bias
-                mask: torch.Tensor          # (B,H,S,S), bool or –∞ float mask
-               ) -> torch.Tensor:           # returns (B,H,S,d_k)
-
-        B, H, S, D = q.shape
-
-        # 1) Compute data-dependent tau
-        gate_q = self.gate(q)
-        q_pert = q  * gate_q
-
-        rms    = torch.sqrt((q_pert**2).mean(-1, keepdim=True) + self.eps)
-        tau    = torch.sqrt(rms**2 + self.nu)  # (B,H,S,1)
-
-        # 2) Convex scalar scores
-        fq = self.score_q(q)  # (B,H,S)
-        gk = self.score_k(k)  # (B,H,S)
-
-        #creativity toggle here
-        if self.creative:
-
-            # Perturb and re-score
-            q_noise = (torch.rand_like(q) - 0.5) * self.noise_scale
-            k_noise = (torch.rand_like(k) - 0.5) * self.noise_scale
-            fq_pert = self.score_q(q + q_noise)   # (B,H,S)
-            gk_pert = self.score_k(k + k_noise)   # (B,H,S)
-            
-            # Regret signal: how much scores changed under noise
-            delta_fq = (fq_pert - fq).detach()
-            delta_gk = (gk_pert - gk).detach()
-            
-            # Shape original score to prefer regret-stable regions
-            fq = fq - delta_fq * 0.1
-            gk = gk - delta_gk * 0.1
-
-        # ---- 3) Random-feature kernel in log-space
-        phi_q   = self.gate(self.lin_h_q(q).clamp_(max=20.0))
-        phi_k   = self.gate(self.lin_h_k(k).clamp_(max=20.0))
-        kernel  = torch.matmul(phi_q, phi_k.transpose(-1,-2)) + self.eps
-        logK    = kernel.log()
-        
-
-        # ---- 4) Build and mask scores
-        scores = fq.unsqueeze(-1) + gk.unsqueeze(-2) + logK + extra_score  # (B,H,S,S)
-        
-        if mask.dtype == torch.bool:
-            valid = mask
-        else:
-            valid = torch.isfinite(mask)
-        
-        # Ensure shape match
-        valid = valid.expand_as(scores)  # (B,H,S,S)
-        
-        drop_val = torch.tensor(-1e9, device=scores.device, dtype=scores.dtype)
-        
-        # ---- 4.5) Secretary cutoff
-        C = 1.0
-        
-        valid_scores = scores.clone()
-        valid_scores[~valid] = -float('inf')  # merge all masking first
-        s_max, _ = valid_scores.max(dim=-1, keepdim=True)
-        cutoff = s_max - C / tau.clamp(min=1e-2)  # keep top ~63%
-        keep = valid_scores >= cutoff
-        final_mask = valid & keep
-        scores = scores.masked_fill(~final_mask, drop_val)
-        
-        # ---- 5) LSE hull
-        tau_exp = tau.expand(-1, -1, -1, S)      # (B,H,S,S)
-        scaled = scores.unsqueeze(-1) * tau_exp.unsqueeze(-1)
-
-        m_scaled, _ = scaled.max(dim=-2, keepdim=True)
-        shifted = scaled - m_scaled
-
-        weights = torch.exp(shifted)
-        weights = weights / weights.sum(dim=-2, keepdim=True).clamp(min=1e-6)
-
-        # Step 2: apply weights to v (instead of broadcasting v)
-        out = torch.einsum('bhijs,bhsd->bhid', weights, v)
 
         return out
 
@@ -787,22 +598,8 @@ class PairwiseHullAttention(nn.Module):
         # pass bias as extra_score keyword
 
         #creativity toggle here
-        if self.creative:
-            n_q = (torch.rand_like(Q) - 0.5) * self.noise_scale
-            n_k = (torch.rand_like(K) - 0.5) * self.noise_scale
-            n_v = (torch.rand_like(V) - 0.5) * self.noise_scale
-            
-            Q_pos, K_pos, V_pos = Q + n_q, K + n_k, V + n_v
-            Q_neg, K_neg, V_neg = Q - n_q, K - n_k, V - n_v
-            
-            # compute attention both ways
-            y_pos = self.mixer(Q_pos, K_pos, V_pos, extra_score=bias, mask=mask)
-            y_neg = self.mixer(Q_neg, K_neg, V_neg, extra_score=bias, mask=mask)
-            
-            # average
-            y = 0.5 * (y_pos + y_neg)
-        else:
-            y = self.mixer(Q, K, V, extra_score=bias, mask=mask)
+        
+        y = self.mixer(Q, K, V, extra_score=bias, mask=mask)
         
         y = y.transpose(1, 2).reshape(B, S, self.embed_dim)
         return self.W_O(y)
@@ -817,7 +614,7 @@ class OmniHullBlock(nn.Module):
     def __init__(self, dim, heads, moe_petals, use=0):
         super().__init__()
         self.attn = PairwiseHullAttention(dim, heads, use=use)
-        self.hff  = VectorHull(dim, [dim * 2,dim//2], petals=moe_petals)
+        self.hff  = VectorHull(dim, [dim * 2], petals=moe_petals)
         self.ln1, self.ln2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
         self.a1, self.a2   = nn.Parameter(torch.zeros(())), nn.Parameter(torch.zeros(()))
 
@@ -903,10 +700,6 @@ class ConvexGPT(nn.Module):
         x = self.ln_f(x)                             # (B, S, embed_dim)
         logits = self.head(x)                        # (B, S, vocab_size)
         return logits
-
-
-
-
 
 
 
