@@ -1,0 +1,25 @@
+This is an expanded definition and description of the model.
+
+1. Overall architecture
+  ConvexGPT
+
+    Embeds tokens into an interleaved even/odd channel space of size 2·M.
+    Stacks OmniHullBlock layers, each operating on the full 2M channels with a causal mask.
+    Final LayerNorm + linear head to logits.
+    *no global positional embedding
+
+  OmniHullBlock
+
+    PairwiseHullAttention on normalized interleaved embeddings
+    VectorHull feed-forward “MLP” replacement
+    Two learnable residual mixing coefficients α₁, α₂ (via softplus gating)
+
+  PairwiseHullAttention
+
+    PreMix: either S4DFFT-based or linear Q/K/V projection
+    ConvexMixer: replaces softmax attention with a tempered log-sum-exp hull
+    ConvexPositionalBias: distance bias convex in |i–j|
+    InterleavedPhaseChannelizer: content→φ gating into odd slots
+    VectorHull (and its scalar counterpart, ScalarHull)
+    A “petaled” batched ICNN (BatchedICNN) computes P parallel convex mappings (“petals”)
+    Aggregates via tempered log-sum-exp over petals → output vector
