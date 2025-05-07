@@ -16,11 +16,7 @@
 * 4: no sequential bottlenecks from scaling
 * 5: Extreme Nonlinear separability
 * 6: Lipschitz is tight, jacobian positive semidefinite, satisfies Jensen's inequality
-* 7: It is differentiable everywhere in its domain. Its derivative is continuous everywhere *except max in logmaxexp.
-
-smooth except at ties (i.e., when multiple x_i values are exactly equal, max(x) is not differentiable).
-However, ties are measure-zero in ℝⁿ (probability zero under continuous distributions), so this does not violate almost everywhere C¹.
-effectively C¹ for all practical gradient-based optimization purposes.
+* 7: It is differentiable everywhere in its domain. Its derivative is continuous everywhere *except max in logmaxexp. (smooth except at ties (i.e., when multiple x_i values are exactly equal, max(x) is not differentiable). However, ties are measure-zero in ℝⁿ (probability zero under continuous distributions), so this does not violate almost everywhere C¹. effectively C¹ for all practical gradient-based optimization purposes.)
 ---
 
 “If you are a student interested in building the next generation of AI systems, don’t work on LLMs. This is in the hands of large companies, there’s nothing you can bring to the table. You should work on next-gen AI systems that lift the limitations of LLMs.”   
