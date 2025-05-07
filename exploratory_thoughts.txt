@@ -1,0 +1,39 @@
+TODO:
+short term, medium term, long term memory *outside* of core modules.
+Integrate more science from my cognitive theory metaphor - mind is a manifold, like the ripples in a body of water when a rock is dropped into them.
+At the center is the input but also the output. memory is stored in the ripples as geometry, used as refraction.
+
+unclear benefits:
+attention forked into vectorhull/MLP
+experiment: attention computes recursively with residual, and its product at each stage sent to vectorhull
+vectorhull products accumulated as transformations on x
+This has had sometimes utility
+
+shared, interpolating attention between layers, combined with standalone vectorhull transformations
+this would use alpha and beta and transformationally update weights before using them
+the result is potentially smoother conceptual drifts, but also utility unknown
+
+problems:
+semantic windowing and phase shifting is complicated. we use frequency basis, but this is provably not correct.
+a "condensing module" designed to "simplify" is possible, but what would it be trained to do?
+this requires more research.
+
+multimodal:
+proposal:
+my experiments show first layer of gabor filter with phase rotations of conv is suitable for visual input.
+tokenization following is possible- requires first condensing via semantic windowing across two axes,
+then performing reshaping:
+take image, perform gabor filtration. provide 8 outputs of shape n,n in greyscale or individual color channel.
+parallel channels as embedding channels if so desired.
+cut and cut transposed to form:
+nA nB
+process each through "embedder" module of attention, vectorhull
+take each and recompose them into 2d array, transpose it, decompose it
+eA,eAt,Eb,EbT- stack all as embeddings in paralllel
+
+you now have your visual embedding of shape:
+batch,heightxwidth,colorchannelsxembeddingdimsx4
+bottleneck or process as desired to obtain latent representation
+
+
+
