@@ -3,6 +3,26 @@ short term, medium term, long term memory *outside* of core modules.
 Integrate more science from my cognitive theory metaphor - mind is a manifold, like the ripples in a body of water when a rock is dropped into them.
 At the center is the input but also the output. memory is stored in the ripples as geometry, used as refraction.
 
+Because train()/eval() are inherited by children, you just need to call .eval() on the submodules you want locked down after any .train() on the full model. The gradient mask (requires_grad) ensures no updates ever flow into those weights.
+
+In other words, I can design a model that continually grows with new knowledge, building integrated logic to freeze petals when information acquisition is optimal for them.
+This wont work in the sense of more layers, but it can mean : added multimodal capacity, insofar that we train basic vision into a front end, and then we add parallel front ends which are the same, and glue into the same base model, but you have added petals in base + cloned front end = domain specific visual knowledge, like individual language recognition. Current multimodal is brute-forced over enormous knowledge base and reliable, but not minimal. Visual pattern matching is concept association. Where do the concepts and their corresponding "meaning" live? should base model be modified to conceptualize the presence of visual information, or visual information adapted to the latent space of textual? What is the ultimate original underlying modality that all other knowledge should live in? language?
+
+here's how existence in this reality works for all lifeforms:
+acquire information
+compare information
+select based on comparison
+recursively compound first three steps until certainty is reached in selection
+recursively compound all but the first step to determine what to do with it.
+repeat
+
+internally, this corresponds to recursive:
+front end filtration/representation
+attention
+hulls
+
+
+
 unclear benefits:
 attention forked into vectorhull/MLP
 experiment: attention computes recursively with residual, and its product at each stage sent to vectorhull
@@ -34,6 +54,8 @@ eA,eAt,Eb,EbT- stack all as embeddings in paralllel
 you now have your visual embedding of shape:
 batch,heightxwidth,colorchannelsxembeddingdimsx4
 bottleneck or process as desired to obtain latent representation
+
+
 
 
 
