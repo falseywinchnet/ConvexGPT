@@ -307,7 +307,7 @@ class FusedLogSumExp(nn.Module):
 class ScalarHull(nn.Module):
     def __init__(self, in_dim: int, petals: int):
         super().__init__()
-        self.register_buffer('nu',  torch.log(torch.tensor(2.71828)))
+        self.register_buffer('nu',  torch.tensor(1.64872127070012814684865078781416357165))
         self.register_buffer('noise_scale', torch.tensor(1e-5))
         self.petals = BatchedICNN(in_dim, petals)
         self.gate   = ConvexGate(in_dim)
@@ -346,7 +346,7 @@ class ScalarHull(nn.Module):
 class VectorHull(nn.Module):
     def __init__(self, dim: int, petals: int):
         super().__init__()
-        self.register_buffer('nu',  torch.log(torch.tensor(2.71828)))
+        self.register_buffer('nu',  torch.tensor(1.64872127070012814684865078781416357165))
         self.register_buffer('noise_scale', torch.tensor(1e-5))
         self.petals = BatchedICNN(dim, petals)
         self.gate   = ConvexGate(dim)
@@ -410,7 +410,7 @@ class ConvexPositionalBias(nn.Module):
 class ConvexMixer(nn.Module):
     def __init__(self, d_k: int, petals: int, r: int):
         super().__init__()
-        self.register_buffer('nu',    torch.tensor(2.71828))
+        self.register_buffer('nu',  torch.tensor(1.64872127070012814684865078781416357165))
         self.register_buffer('eps',   torch.tensor(1e-6))
         self.register_buffer('noise_scale', torch.tensor(1e-5))
 
@@ -420,7 +420,7 @@ class ConvexMixer(nn.Module):
         self.lin_h_q = nn.Linear(d_k, r, bias=False)
         self.lin_h_k = nn.Linear(d_k, r, bias=False)
         self.register_buffer("creative", torch.tensor(True))
-        # remove fused_lse_mixer entirely
+        self.fused = FusedLogSumExp(dim=-1)                          # or cache this module
 
     def forward(self,
                 q: torch.Tensor,           # (B,H,S,d_k)
@@ -454,8 +454,13 @@ class ConvexMixer(nn.Module):
         # ——— 3) random-feature kernel ———
         phi_q = self.gate(self.lin_h_q(q).clamp(max=20.0))
         phi_k = self.gate(self.lin_h_k(k).clamp(max=20.0))
-        kernel = phi_q.matmul(phi_k.transpose(-1,-2)) + self.eps  # (B,H,S,S)
-        logK   = kernel.log()
+        # 1) compute elementwise sums in log-space
+        a     = torch.log(phi_q + self.eps)                     # (B,H,S,r)
+        b     = torch.log(phi_k + self.eps)                     # (B,H,S,r)
+        sum_ab = a.unsqueeze(-2) + b.unsqueeze(-3)              # (B,H,S,S,r)
+        
+        # 2) log-sum-exp over the feature axis via your fused LSE
+        logK  = self.fused(sum_ab).squeeze(-1)                       # (B,H,S,S)
 
         # ——— 4) build & mask scores ———
         scores = fq.unsqueeze(-1) + gk.unsqueeze(-2) + logK + extra_score  # (B,H,S,S)
@@ -682,6 +687,7 @@ class ConvexGPT(nn.Module):
         x = self.ln_f(x)                             # (B, S, embed_dim)
         logits = self.head(x)                        # (B, S, vocab_size)
         return logits
+
 
 
 
