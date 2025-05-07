@@ -7,6 +7,8 @@ import math
 from pathlib import Path
 from typing import List,Literal
 
+
+
         
 class S4DFFT(nn.Module):
     """
@@ -20,6 +22,7 @@ class S4DFFT(nn.Module):
         d_model: int,
         N: int          = 64,          # # diagonal modes
         init: str       = "hippoD",    # 'hippoD' | 'inverse' | 'linear'
+        short_thresh: int = 512,       # switch to recurrent if T ≤ this
         tau_min: float  = 1e-4,        # clamp on exp(log_tau)
     ):
         super().__init__()
@@ -318,8 +321,8 @@ class ScalarHull(nn.Module):
             xg   = x  * g # (..., D)
 
         # compute τ using a soft logistic
-        r   = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)  # (..., 1)
-        tau = torch.sqrt(self.nu) + F.softplus(r)
+        r = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        tau = torch.exp(0.30343 * r + 0.22159)
         # get each petal’s vector output, then reduce to scalar per petal
         out_all = self.petals(xg)                  # (..., P, D)
         scores  = out_all.mean(dim=-1)             # (..., P)
@@ -336,7 +339,6 @@ class ScalarHull(nn.Module):
 class VectorHull(nn.Module):
     def __init__(self, dim: int, petals: int):
         super().__init__()
-        self.register_buffer('nu',  torch.tensor(1.64872127070012814684865078781416357165))
         self.register_buffer('noise_scale', torch.tensor(1e-5))
         self.petals = BatchedICNN(dim, petals)
         self.gate   = ConvexGate(dim)
@@ -355,8 +357,8 @@ class VectorHull(nn.Module):
             xg   = x  * g # (..., D)
 
         # compute τ using a soft logistic
-        r    = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)  # (..., 1)
-        tau = torch.sqrt(self.nu) + F.softplus(r)                             # (..., 1)
+        r = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        tau = torch.exp(0.30343 * r + 0.22159) #emulate soft logistic with v at sqrt(e)                          # (..., 1)
 
         # batched petals → one vector per petal
         out_all = self.petals(xg)                # (..., P, D)
@@ -424,9 +426,9 @@ class ConvexMixer(nn.Module):
 
         # ——— 1) tau ———
         gate_q = self.gate(q)                          # (B,H,S,d_k)
-        q_pert = q * gate_q
-        rms    = torch.sqrt(q_pert.pow(2).mean(-1, keepdim=True) + self.eps)
-        tau    = torch.sqrt(rms.pow(2) + self.nu)      # (B,H,S,1)
+        q = q * gate_q
+        r = torch.sqrt(q.pow(2).mean(-1, keepdim=True) + self.eps)
+        tau = torch.exp(0.30343 * r + 0.22159)  # or + tau_min
 
         # ——— 2) scalar hull scores ———
         fq = self.score_q(q)  # (B,H,S)
@@ -677,8 +679,6 @@ class ConvexGPT(nn.Module):
         x = self.ln_f(x)                             # (B, S, embed_dim)
         logits = self.head(x)                        # (B, S, vocab_size)
         return logits
-
-
 
 
 
