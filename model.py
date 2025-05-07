@@ -7,8 +7,6 @@ import math
 from pathlib import Path
 from typing import List,Literal
 
-
-
         
 class S4DFFT(nn.Module):
     """
@@ -456,12 +454,9 @@ class ConvexMixer(nn.Module):
         logK  = self.fused(sum_ab).squeeze(-1)                       # (B,H,S,S)
 
         # ——— 4) build & mask scores ———
+        log_gate = torch.log(mask.clamp_min(self.eps))         # (1,1,S,S) or (B,H,S,S)
+        extra_score = extra_score + log_gate                   # soft gating of positional bias
         scores = fq.unsqueeze(-1) + gk.unsqueeze(-2) + logK + extra_score  # (B,H,S,S)
-        if mask.dtype == torch.bool:
-            valid = mask
-        else:
-            valid = torch.isfinite(mask)
-        scores = scores.masked_fill(~valid, -1e9)
 
         # ——— 5) 4-D tempered LSE hull ———
         tau4 = tau.squeeze(-1)                # (B,H,S)
@@ -469,7 +464,7 @@ class ConvexMixer(nn.Module):
 
         m, _      = scaled.max(dim=-1, keepdim=True)                     # (B,H,S,1)
         exp_s     = torch.exp(scaled - m)                                 # (B,H,S,S)
-        exp_s     = exp_s.masked_fill(~valid, 0.0)                        # zero out masked
+        exp_s = exp_s * mask
         denom     = exp_s.sum(dim=-1, keepdim=True).clamp(min=self.eps)   # (B,H,S,1)
         weights   = exp_s / denom                                          # (B,H,S,S)
 
@@ -513,13 +508,14 @@ class InterleavedPhaseChannelizer(nn.Module):
         x_c = x[..., 0::2]                  # (B, T, M)
 
         # 2) build deterministic distance kernel W[i,j] = 1 / (1 + |i-j|)
+        # 2–3) build and apply convex mask to distance kernel
         with torch.no_grad():
             pos = torch.arange(T, device=device, dtype=dtype)
             dist = (pos.unsqueeze(0) - pos.unsqueeze(1)).abs()
-            W = 1.0 / (dist + 1.0)
+            W = 1.0 / (dist + 1.0)                              # (T, T)
             if mask is not None:
-                W = W * mask.view(T, T).to(dtype)
-            W = W / W.sum(-1, keepdim=True).clamp(min=1e-6)
+                W = W * mask.view(T, T).to(dtype)              # soft gate
+            W = W / W.sum(-1, keepdim=True).clamp(min=1e-6)    # row-normalize
 
         # 3) apply the causal+padding mask
         causal2d = mask.view(T, T)                          # (T, T)
@@ -573,11 +569,6 @@ class PairwiseHullAttention(nn.Module):
         K = (K - mean) / std
         
         bias = self.pos(S).unsqueeze(0)
-        if mask is not None:
-            bias = bias.masked_fill(~mask, float('-inf'))
-        # pass bias as extra_score keyword
-
-        #creativity toggle here
         
         y = self.mixer(Q, K, V, extra_score=bias, mask=mask)
         
@@ -643,11 +634,18 @@ class ConvexGPT(nn.Module):
         self.head = nn.Linear(self.embed_dim, vocab_size, bias=False)
         self.set_creativity(creativity)
 
+    #@staticmethod
+    #def _causal_mask(S: int, device: torch.device) -> torch.Tensor:
+     #   # shape (1, 1, S, S) where True = allowed
+     #   return torch.tril(torch.ones(S, S, dtype=torch.bool, device=device)) \
+     #              .unsqueeze(0).unsqueeze(1)
     @staticmethod
-    def _causal_mask(S: int, device: torch.device) -> torch.Tensor:
-        # shape (1, 1, S, S) where True = allowed
-        return torch.tril(torch.ones(S, S, dtype=torch.bool, device=device)) \
-                   .unsqueeze(0).unsqueeze(1)
+    def _causal_mask(S: int, device: torch.device, steepness: float = 50.0):
+        pos = torch.arange(S, device=device, dtype=torch.float)
+        diff = pos.unsqueeze(1) - pos.unsqueeze(0)  # Positive for future positions
+        # Exponential barrier (always convex)
+        mask = torch.exp(-steepness * F.softplus(diff))
+        return mask.unsqueeze(0).unsqueeze(1)
 
     def set_creativity(self, value: bool):
         val = torch.tensor(value)
@@ -680,6 +678,7 @@ class ConvexGPT(nn.Module):
         x = self.ln_f(x)                             # (B, S, embed_dim)
         logits = self.head(x)                        # (B, S, vocab_size)
         return logits
+
 
 
 
