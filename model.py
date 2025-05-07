@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 from typing import List,Literal
 
-
+#c1 everywhere BUT logsumexp because of the max
 
         
 class S4DFFT(nn.Module):
@@ -459,15 +459,12 @@ class ConvexMixer(nn.Module):
         extra_score = extra_score + log_gate                   # soft gating of positional bias
         scores = fq.unsqueeze(-1) + gk.unsqueeze(-2) + logK + extra_score  # (B,H,S,S)
 
-        # ——— 5) 4-D tempered LSE hull ———
+        # ——— 5) 4-D tempered LSE hull, in log space ———
         tau4 = tau.squeeze(-1)                # (B,H,S)
-        scaled = scores * tau4.unsqueeze(-1)  # (B,H,S,S)
-
-        m, _      = scaled.max(dim=-1, keepdim=True)                     # (B,H,S,1)
-        exp_s     = torch.exp(scaled - m)                                 # (B,H,S,S)
-        exp_s = exp_s * mask
-        denom     = exp_s.sum(dim=-1, keepdim=True).clamp(min=self.eps)   # (B,H,S,1)
-        weights   = exp_s / denom                                          # (B,H,S,S)
+        logits = scores * tau4.unsqueeze(-1)
+        logits = logits + torch.log(mask.clamp_min(self.eps))
+        log_weights = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+        weights = torch.exp(log_weights)                                      # (B,H,S,S)
 
         # ——— 6) single batched bmm for output ———
         w_mat = weights.reshape(B * H, S, S)  # (B*H, S, S)
@@ -680,189 +677,4 @@ class ConvexGPT(nn.Module):
         logits = self.head(x)                        # (B, S, vocab_size)
         return logits
 
-
-
-
-#training,eval loop 
-import os
-import pickle
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-from torch.optim import AdamW
-from torch.optim.optimizer import Optimizer
-from typing import Literal
-device    = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-@torch.jit.script
-def wolf_update(p: torch.Tensor,
-                g: torch.Tensor,
-                state_p: torch.Tensor,
-                lr: float):
-    # define your constants here instead of capturing them
-    etcerta: float = 0.367879441
-    et:      float = 1.0 - etcerta
-
-    # same logic as before
-    update    = state_p * et + g * etcerta
-    new_state = state_p * et + update * etcerta
-    sign_agree = torch.sign(update) * torch.sign(g)
-    update    = update + (torch.rand_like(update)*2 - 1) * etcerta * update
-    p_new     = torch.where(sign_agree > 0, p - lr * update, p)
-    return p_new, new_state
-
-class Wolf(Optimizer):
-    def __init__(self, params, lr=1e-3):
-        defaults = dict(lr=lr)
-        super().__init__(params, defaults)
-        for group in self.param_groups:
-            for p in group['params']:
-                self.state[p]['p'] = torch.zeros_like(p)
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = closure() if closure is not None else None
-        for group in self.param_groups:
-            lr = group['lr']
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                state_p = self.state[p]['p']
-                p_new, new_state = wolf_update(p.data, p.grad, state_p, lr)
-                p.data.copy_(p_new)
-                state_p.copy_(new_state)
-        return loss
-
-# 1) Load data and meta as before
-data_dir  = os.path.dirname(base_dir)
-train_ids = np.fromfile(os.path.join(data_dir, 'train.bin'), dtype=np.uint16)
-val_ids   = np.fromfile(os.path.join(data_dir, 'val.bin'),   dtype=np.uint16)
-with open(os.path.join(data_dir, 'meta.pkl'), 'rb') as f:
-    meta = pickle.load(f)
-vocab_size = meta['vocab_size']
-
-# 2) Compute data‐marginal q[v]
-counts = np.bincount(train_ids, minlength=vocab_size).astype(float)
-q = torch.tensor(counts / counts.sum(), dtype=torch.float32, device=device)  # [V]
-
-# 3) Dataset + DataLoader
-class CharDataset(Dataset):
-    def __init__(self, data, block_size):
-        self.data = torch.from_numpy(data).long()
-        self.block_size = block_size
-    def __len__(self):
-        return len(self.data) - self.block_size
-    def __getitem__(self, idx):
-        x = self.data[idx : idx + self.block_size]
-        y = self.data[idx + 1 : idx + self.block_size + 1]
-        return x, y
-
-block_size = 256
-train_loader = DataLoader(CharDataset(train_ids, block_size),
-                          batch_size=32, shuffle=True, drop_last=True)
-val_loader   = DataLoader(CharDataset(val_ids,   block_size),
-                          batch_size=32, shuffle=False, drop_last=True)
-
-# 4) Model, optimizer, loss
-virgin = ConvexGPT(vocab_size = vocab_size,embed_dim  = 64,depth  = 2,heads = 2,petals = 8)
-
-print("Number of parameters: ", sum(p.numel() for p in virgin.parameters()))
-model = torch.jit.script(virgin)
-model.to(device)
-optimizer = AdamW(model.parameters(), lr=2e-3)#or adam, but i prefer the WOLF.
-criterion = nn.CrossEntropyLoss()
-losses = []
-# 6) Train / eval functions
-def train_epoch():
-    model.train()
-    total_loss = 0
-    for xb, yb in train_loader:
-        xb, yb = xb.to(device), yb.to(device)
-
-        # Forward
-        logits = model(xb)                 # (B, T, V)
-        B, T, V = logits.shape
-        p = F.softmax(logits, dim=-1)      # (B, T, V)
-
-        # 1) Standard CE
-        loss = criterion(logits.view(B*T, V),
-                            yb.view(B*T))
-        # Backprop
-        optimizer.zero_grad()
-        
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)#because things do explode sometimes
-        optimizer.step()
-        print(loss.item())
-        total_loss += loss.item()
-        losses.append(loss.item())
-    return total_loss / len(train_loader)
-
-@torch.no_grad()
-def eval_epoch():
-    model.eval()
-    total_loss = 0
-    for xb, yb in val_loader:
-        xb, yb = xb.to(device), yb.to(device)
-        logits = model(xb)
-        B, T, V = logits.shape
-        total_loss += criterion(logits.view(B*T,V),
-                                yb.view(B*T)).item()
-    return total_loss / len(val_loader)
-
-# 7) Run training
-num_epochs = 10
-for epoch in range(1, num_epochs+1):
-    train_loss = train_epoch() 
-    val_loss   = eval_epoch()
-    print(f"Epoch {epoch:2d} | train: {train_loss:.4f} | val: {val_loss:.4f}")
-
-
-
-# --- helpers ---------------------------------------------------------
-def fenchel_decode(logits, tau=1.0, iters=3):
-    """Fenchel‑dual KL‑regularised projection of -logits (energy)."""
-    energy = -logits                        # (B,V)
-    p = torch.full_like(energy, 1.0 / energy.size(-1))  # uniform start
-    for _ in range(iters):
-        p = torch.softmax((-energy / tau) + p.log(), dim=-1)
-    return p
-    
-
-# --- generation ------------------------------------------------------
-use_fenchel   = False          # flip to compare
-tau           = 1.0           # λ  (temperature analogue)
-max_new_tokens = 4000
-top_k          = 25
-block_size     = 128
-temperature    = 1.0
-
-bcontext_str = "To be, or not to be,"
-context_ids = torch.tensor([[ stoi[c] for c in bcontext_str ]],
-                           dtype=torch.long)
-context_ids = context_ids.to(device)
-
-
-generated = context_ids.clone()  # (1,T0)
-model.eval()
-with torch.no_grad():
-  for _ in range(max_new_tokens):
-    input_ids = generated[:, -block_size:]        # casual block
-    logits = model(input_ids)[:, -1, :] / temperature
-    # top‑k mask
-    if top_k is not None:
-        v, _ = torch.topk(logits, top_k)
-        logits[logits < v[:, [-1]]] = -1e10
-
-    if use_fenchel:
-        probs = fenchel_decode(logits, tau=tau, iters=3)
-    else:
-        probs = torch.softmax(logits, dim=-1)
-
-    next_id = torch.multinomial(probs, num_samples=1)   # (1,1)
-    generated = torch.cat([generated, next_id], dim=1)
-
-print('> ', ''.join(itos[i] for i in generated[0].tolist()))
 
