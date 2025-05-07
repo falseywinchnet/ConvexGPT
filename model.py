@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import List,Literal
 
 
+
         
 class S4DFFT(nn.Module):
     """
@@ -319,10 +320,9 @@ class ScalarHull(nn.Module):
         else:
             xg   = x  * g # (..., D)
 
-        # compute τ
+        # compute τ using a soft logistic
         r   = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)  # (..., 1)
-        tau = torch.sqrt(r.pow(2) + self.nu)                               # (..., 1)
-
+        tau = torch.sqrt(self.nu) + F.softplus(r)
         # get each petal’s vector output, then reduce to scalar per petal
         out_all = self.petals(xg)                  # (..., P, D)
         scores  = out_all.mean(dim=-1)             # (..., P)
@@ -357,9 +357,9 @@ class VectorHull(nn.Module):
         else:
             xg   = x  * g # (..., D)
 
-        # compute τ
+        # compute τ using a soft logistic
         r    = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)  # (..., 1)
-        tau  = torch.sqrt(r.pow(2) + self.nu)                              # (..., 1)
+        tau = torch.sqrt(self.nu) + F.softplus(r)                             # (..., 1)
 
         # batched petals → one vector per petal
         out_all = self.petals(xg)                # (..., P, D)
@@ -680,6 +680,7 @@ class ConvexGPT(nn.Module):
         x = self.ln_f(x)                             # (B, S, embed_dim)
         logits = self.head(x)                        # (B, S, vocab_size)
         return logits
+
 
 
 
