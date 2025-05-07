@@ -662,8 +662,10 @@ class ConvexGPT(nn.Module):
         B, S = idx.shape
         device = idx.device
         #stack 0::2 as embeddings, 1::2 as zeros for positional embeddings
-        x = torch.stack([self.token_emb(idx), torch.zeros_like(self.token_emb(idx))], dim=-1).reshape(idx.shape[0], idx.shape[1], 2 * self.token_emb.embedding_dim)
-        x = x.to(dtype=self.token_emb.weight.dtype)
+        E = self.token_emb.weight                             # (V, D)
+        E_proc = (torch.tanh(E))                    # log-domain safe
+        embeddings = F.embedding(idx, E_proc)                 # (B, S, D)
+        x = torch.stack([embeddings, torch.zeros_like(self.token_emb(idx))], dim=-1).reshape(idx.shape[0], idx.shape[1], 2 * self.token_emb.embedding_dim)
 
         # 3) build causal mask
         mask = self._causal_mask(S, device)          # (1, 1, S, S)
