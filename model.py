@@ -20,7 +20,6 @@ class S4DFFT(nn.Module):
         d_model: int,
         N: int          = 64,          # # diagonal modes
         init: str       = "hippoD",    # 'hippoD' | 'inverse' | 'linear'
-        short_thresh: int = 512,       # switch to recurrent if T ≤ this
         tau_min: float  = 1e-4,        # clamp on exp(log_tau)
     ):
         super().__init__()
