@@ -6,8 +6,6 @@ import torch.nn.functional as F
 import math
 from pathlib import Path
 from typing import List,Literal
-
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -189,121 +187,77 @@ class LinearPreMix(nn.Module):
         v = v.view(B, S, self.heads, self.d_k).transpose(1,2)
         return q, k, v
 
-
-# ----------  Positive weight layer with Hoedt–Klambauer init ----------
-# ---------------------------------------------------------------------
-# PositiveLinear – strictly‑positive weights with HL init + safe interface
-# ---------------------------------------------------------------------
-class PositiveLinear(nn.Module):
-    def __init__(self, d_in, d_out, bias=True):
-        super().__init__()
-        self.raw  = nn.Parameter(torch.empty(d_out, d_in))
-        self.bias = nn.Parameter(torch.empty(d_out)) if bias else None
-        with torch.no_grad():
-            nn.init.normal_(self.raw, mean=math.log(math.sqrt(2/d_in)), std=0.2)
-            if self.bias is not None: self.bias.zero_()
-
-    @property
-    def weight(self):                        # strictly positive
-        return F.softplus(self.raw).pow(2)
-
-    def forward(self, x):
-        return F.linear(x, self.weight, self.bias)
-
-'''   
-#note: this will do it faster but will use more memory.
+        
 class BatchedICNN(nn.Module):
-    """
-    Fully vectorized BatchedICNN: supports arbitrary input dimensions.
-    Input:  x of shape (..., D_in)
-    Output: tensor of shape (..., P, D_out_last)
-
-    """
-    def __init__(self, in_dim: int, hidden_dims: list, petals: int):
+    def __init__(self, in_dim: int, petals: int):
         super().__init__()
+        self.in_dim = in_dim
         self.P = petals
-        dims = [in_dim] + hidden_dims + [in_dim]
-        # ParameterList for each layer's weights and biases
-        self.W_raw = nn.ParameterList()
-        self.bias = nn.ParameterList()
-        for d_in, d_out in zip(dims[:-1], dims[1:]):
-            w = nn.Parameter(
-                torch.randn(petals, d_out, d_in) * 0.2 + math.log(math.sqrt(2.0 / d_in))
-            )
-            b = nn.Parameter(torch.zeros(petals, d_out))
-            self.W_raw.append(w)
-            self.bias.append(b)
-        self.act = nn.Softplus()
-      
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (..., D_in) → y: (..., P, D_out_last)
-        Supports arbitrary input dimensions efficiently.
-        """
-        # Save original shape and dimensions
-        orig_shape = x.shape
-        D_in = orig_shape[-1]
-        
-        # Flatten batch dimensions
-        x_flat = x.reshape(-1, D_in)             # (N, D_in)
-        batch_size = x_flat.size(0)
-        
-        # Duplicate input for each petal
-        x_petals = x_flat.unsqueeze(1).expand(batch_size, self.P, D_in)  # (N, P, D_in)
-        x_input = x_flat.unsqueeze(1).expand(batch_size, self.P, D_in)  # (N, P, D_in)
+        D = in_dim
+        # layer dims: D → 2D → D
+        self.d1, self.d2 = 2 * D, D
 
-        # Apply each layer
-        for W_raw, W_y, bias in zip(self.W_raw, self.W_y, self.bias):
-            # Process all petals at once using einsum
-            # x_petals: (N, P, D_in), W_raw: (P, D_out, D_in) -> (N, P, D_out)
-            x_petals = torch.einsum('npi,poj->npo', x_petals, W_raw)
+        # first-layer weights: (P, d1, D)
+        self.weight_raw_0 = nn.Parameter(self._init_weight(petals, self.d1, D))
+        self.bias_0       = nn.Parameter(torch.zeros(petals, self.d1))
 
-            x_petals.add_(bias.unsqueeze(0))              # in-place bias add
-            x_petals = self.act(x_petals)                 # result goes back into x_petals
-        
-        # Reshape to original dimensions + petal dimension
-        output_shape = orig_shape[:-1] + (self.P, x_petals.size(-1))
-        return x_petals.reshape(output_shape)
+        # second-layer weights: (P, d2, d1)
+        self.weight_raw_1 = nn.Parameter(self._init_weight(petals, self.d2, self.d1))
+        self.bias_1       = nn.Parameter(torch.zeros(petals, self.d2))
 
-'''
+        # per-petal residual projection weight: maps 2D → D: shape (P, d1, d2)
+        self.z_weight = nn.Parameter(torch.empty(petals, self.d1, self.d2))
+        nn.init.kaiming_uniform_(self.z_weight, a=math.sqrt(5))
 
-class ICNN(nn.Module):
-    def __init__(self, in_dim: int, hidden_dims: list):
-        super().__init__()
-        dims = [in_dim] + hidden_dims + [in_dim]
-        self.layers = nn.ModuleList([
-            PositiveLinear(dims[i], dims[i+1]) for i in range(len(dims)-1)
-        ])
-        self.softplus = nn.Softplus()
+        # gating scalars
+        self.gate_raw_0 = nn.Parameter(torch.full((petals,), -3.0))
+        self.gate_raw_1 = nn.Parameter(torch.full((petals,), -3.0))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = x
-        for layer in self.layers:
-            z = self.softplus(layer(z))
-        return z
-
-class MultiPetalICNN(nn.Module):
-    def __init__(self, in_dim, hidden_dims, petals):
-        super().__init__()
-        self.petals = nn.ModuleList([
-            ICNN(in_dim, hidden_dims) for _ in range(petals)
-        ])
-        self.W_y = nn.ParameterList([
-            nn.Parameter(torch.randn(in_dim, in_dim) * 0.1) for _ in range(petals)
-        ])
-        self.bias = nn.ParameterList([
-            nn.Parameter(torch.zeros(in_dim)) for _ in range(petals)
-        ])
+        self.output_bias = nn.Parameter(torch.zeros(petals, D))
         self.act = nn.Softplus()
 
+    def _init_weight(self, petals: int, d_out: int, d_in: int) -> torch.Tensor:
+        w = torch.empty(petals, d_out, d_in)
+        with torch.no_grad():
+            mean = math.log(math.sqrt(2.0 / d_in))
+            nn.init.normal_(w, mean=mean, std=0.2)
+        return w
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-      out = []
-      for icnn, b in zip(self.petals, self.bias):
-          z = icnn(x)
-          out.append(self.act(z + b)) #no residual bias allowed in this model.
+        # x: (..., D)
+        orig = x.shape
+        x_flat = x.reshape(-1, self.in_dim)          # (N, D)
+        N = x_flat.size(0)
 
-      return torch.stack(out, dim=-2)
+        # prepare weights & gates
+        w0 = F.softplus(self.weight_raw_0).pow(2)    # (P, 2D, D)
+        w1 = F.softplus(self.weight_raw_1).pow(2)    # (P, D, 2D)
+        g0 = torch.sigmoid(self.gate_raw_0).view(self.P, 1, 1)  # (P,1,1)
+        g1 = torch.sigmoid(self.gate_raw_1).view(self.P, 1, 1)
 
+        # ----- first layer across petals -----
+        x_in = x_flat.unsqueeze(0).expand(self.P, N, self.in_dim)       # (P, N, D)
+        x_w0 = torch.bmm(x_in, w0.transpose(1,2))                       # (P, N, 2D)
+        x_w0 = x_w0 + self.bias_0.unsqueeze(1)                          # (P, N, 2D)
+        z0   = self.act(x_w0 * g0)                                      # (P, N, 2D)
+
+        # ----- second layer -----
+        x_w1 = torch.bmm(z0, w1.transpose(1,2))                         # (P, N, D)
+        x_w1 = x_w1 + self.bias_1.unsqueeze(1)                          # (P, N, D)
+
+        # ----- residual path via bmm -----
+        # z_weight: (P, 2D, D), z0: (P, N, 2D) → z_mapped: (P, N, D)
+        z_mapped = torch.bmm(z0, self.z_weight)                         # (P, N, D)
+
+        # combine, activate, add final bias
+        z1 = self.act(x_w1 * g1 + z_mapped)                             # (P, N, D)
+        out = z1 + self.output_bias.unsqueeze(1)                        # (P, N, D)
+
+        # reshape back to original leading dims + (P, D)
+        out = out.permute(1, 0, 2)  # (N, P, D)
+        lead_dims = list(orig[:-1])                 # e.g. [B, H, T]
+        new_shape = lead_dims + [self.P, self.in_dim]  # [B, H, T, P, D]
+        return out.reshape(new_shape)
         
 
 class ConvexGate(nn.Module):
@@ -319,15 +273,47 @@ class ConvexGate(nn.Module):
         u = self.softplus(self.lin(x))      # convex, ≥ 0
         return 1.0 - torch.exp(-u)       # convex, ∈ (0,1)
 
+class _FusedLogSumExp(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, dim):
+        m, _ = x.max(dim=dim, keepdim=True)
+        y = x - m
+        ex = y.exp()
+        s = ex.sum(dim=dim, keepdim=True)
+        lse = m + s.log()
+        ctx.save_for_backward(ex, s)
+        ctx.dim = dim
+        return lse
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        ex, s = ctx.saved_tensors
+        dim = ctx.dim
+        grad_x = grad_output * (ex / s)
+        return grad_x, None
+
+# TorchScript-compatible wrapper
+class FusedLogSumExp(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    @torch.jit.ignore
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _FusedLogSumExp.apply(x, self.dim)
+
+
+
 class ScalarHull(nn.Module):
-    def __init__(self, in_dim: int, hidden_dims: List[int], petals: int):
+    def __init__(self, in_dim: int, petals: int):
         super().__init__()
         self.register_buffer('nu',  torch.log(torch.tensor(2.71828)))
         self.register_buffer('noise_scale', torch.tensor(1e-5))
-        self.petals = MultiPetalICNN(in_dim, hidden_dims, petals)
+        self.petals = BatchedICNN(in_dim, petals)
         self.gate   = ConvexGate(in_dim)
         self.register_buffer("creative", torch.tensor(True))
         self.register_buffer('eps', torch.tensor(1e-6))
+        self.fused_lse_hulls = FusedLogSumExp(dim=-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (..., D)
@@ -351,20 +337,22 @@ class ScalarHull(nn.Module):
         # tempered LSE over petals
         # scaled: (..., P) = scores * τ
         scaled = scores * tau                     # broadcasts τ→[...,1]→[...,P]
-        lse    = torch.logsumexp(scaled, dim=-1, keepdim=True)  # (..., 1)
+
+        lse    = self.fused_lse_hulls(scaled)  # (..., 1)
 
         # divide by τ and squeeze
         return (lse / tau).squeeze(-1)             # (...,)
 
 class VectorHull(nn.Module):
-    def __init__(self, dim: int, hidden_dims: List[int], petals: int):
+    def __init__(self, dim: int, petals: int):
         super().__init__()
         self.register_buffer('nu',  torch.log(torch.tensor(2.71828)))
         self.register_buffer('noise_scale', torch.tensor(1e-5))
-        self.petals = MultiPetalICNN(dim, hidden_dims, petals)
+        self.petals = BatchedICNN(dim, petals)
         self.gate   = ConvexGate(dim)
         self.register_buffer("creative", torch.tensor(True))
         self.register_buffer('eps', torch.tensor(1e-6))
+        self.fused_lse_hulls = FusedLogSumExp(dim=-1)    # <— same as in ScalarHull
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (..., D)
@@ -385,13 +373,20 @@ class VectorHull(nn.Module):
 
         # tempered LSE per feature: multiply each petal-vector by τ
         # tau.unsqueeze(-1): (..., 1, 1) → broadcasts to (..., P, D)
-        scaled = out_all * tau.unsqueeze(-1)     
-
-        # collapse petal axis = -2
-        lse    = torch.logsumexp(scaled, dim=-2) # (..., D)
-
-        # divide by τ (still shape (...,1)), broadcasts to (...,D)
-        return lse / tau                         # (..., D)
+        # currently: scaled shape = (..., P, D)
+        scaled = out_all * tau.unsqueeze(-1)
+        
+        # 1) move petal axis to the end
+        scaled = scaled.transpose(-2, -1)       # now shape (..., D, P)
+        
+        # 2) fused‐LSE over −1
+        lse = self.fused_lse_hulls(scaled)          # shape (..., D, 1)
+        
+        # 3) remove the singleton
+        lse = lse.squeeze(-1)                  # shape (..., D)
+        
+        # 4) divide by τ
+        return lse / tau                    # (..., D)
 
 class ConvexPositionalBias(nn.Module):
     """
@@ -413,92 +408,79 @@ class ConvexPositionalBias(nn.Module):
     
         
 class ConvexMixer(nn.Module):
-    """
-    Convex, softmax-free attention via tempered log-sum-exp hull,
-    with per-component debug printing.
-    """
-
     def __init__(self, d_k: int, petals: int, r: int):
         super().__init__()
-        self.register_buffer('nu',  torch.tensor(2.71828))
-        self.register_buffer('eps', torch.tensor(1e-6))
+        self.register_buffer('nu',    torch.tensor(2.71828))
+        self.register_buffer('eps',   torch.tensor(1e-6))
         self.register_buffer('noise_scale', torch.tensor(1e-5))
 
-        self.score_q = ScalarHull(d_k, [d_k*2], petals)
-        self.score_k = ScalarHull(d_k, [d_k*2], petals)
-        self.gate     = nn.Softplus()
-        self.lin_h_q  = nn.Linear(d_k, r, bias=False)
-        self.lin_h_k  = nn.Linear(d_k, r, bias=False)
+        self.score_q = ScalarHull(d_k, petals)
+        self.score_k = ScalarHull(d_k, petals)
+        self.gate    = nn.Softplus()
+        self.lin_h_q = nn.Linear(d_k, r, bias=False)
+        self.lin_h_k = nn.Linear(d_k, r, bias=False)
         self.register_buffer("creative", torch.tensor(True))
+        # remove fused_lse_mixer entirely
 
     def forward(self,
-                q: torch.Tensor,            # (B,H,S,d_k)
-                k: torch.Tensor,            # (B,H,S,d_k)
-                v: torch.Tensor,            # (B,H,S,d_k)
-                extra_score: torch.Tensor,  # (B,H,S,S), finite bias
-                mask: torch.Tensor          # (B,H,S,S), bool or –∞ float mask
-               ) -> torch.Tensor:           # returns (B,H,S,d_k)
+                q: torch.Tensor,           # (B,H,S,d_k)
+                k: torch.Tensor,           # (B,H,S,d_k)
+                v: torch.Tensor,           # (B,H,S,d_k)
+                extra_score: torch.Tensor, # (B,H,S,S)
+                mask: torch.Tensor         # (B,H,S,S)
+               ) -> torch.Tensor:          # returns (B,H,S,d_k)
 
         B, H, S, D = q.shape
 
-        # 1) Compute data-dependent tau
-        gate_q = self.gate(q)
+        # ——— 1) tau ———
+        gate_q = self.gate(q)                          # (B,H,S,d_k)
+        q_pert = q * gate_q
+        rms    = torch.sqrt(q_pert.pow(2).mean(-1, keepdim=True) + self.eps)
+        tau    = torch.sqrt(rms.pow(2) + self.nu)      # (B,H,S,1)
 
-        #creativity toggle here
-        q_pert = q  * gate_q
-
-        rms    = torch.sqrt((q_pert**2).mean(-1, keepdim=True) + self.eps)
-        tau    = torch.sqrt(rms**2 + self.nu)  # (B,H,S,1)
-
-        # 2) Convex scalar scores
+        # ——— 2) scalar hull scores ———
         fq = self.score_q(q)  # (B,H,S)
         gk = self.score_k(k)  # (B,H,S)
-
-        #creativity toggle here
         if self.creative:
+            qn = (torch.rand_like(q) - 0.5) * self.noise_scale
+            kn = (torch.rand_like(k) - 0.5) * self.noise_scale
+            fq_ = self.score_q(q + qn)
+            gk_ = self.score_k(k + kn)
+            delta_fq = (fq_ - fq).detach()
+            delta_gk = (gk_ - gk).detach()
+            fq = fq - 0.1 * delta_fq
+            gk = gk - 0.1 * delta_gk
 
-            # Perturb and re-score
-            q_noise = (torch.rand_like(q) - 0.5) * self.noise_scale
-            k_noise = (torch.rand_like(k) - 0.5) * self.noise_scale
-            fq_pert = self.score_q(q + q_noise)   # (B,H,S)
-            gk_pert = self.score_k(k + k_noise)   # (B,H,S)
-            
-            # Regret signal: how much scores changed under noise
-            delta_fq = (fq_pert - fq).detach()
-            delta_gk = (gk_pert - gk).detach()
-            
-            # Shape original score to prefer regret-stable regions
-            fq = fq - delta_fq * 0.1
-            gk = gk - delta_gk * 0.1
+        # ——— 3) random-feature kernel ———
+        phi_q = self.gate(self.lin_h_q(q).clamp(max=20.0))
+        phi_k = self.gate(self.lin_h_k(k).clamp(max=20.0))
+        kernel = phi_q.matmul(phi_k.transpose(-1,-2)) + self.eps  # (B,H,S,S)
+        logK   = kernel.log()
 
-        # 3) Random-feature kernel in log-space
-        phi_q   = self.gate(self.lin_h_q(q).clamp(max=20.0))
-        phi_k   = self.gate(self.lin_h_k(k).clamp(max=20.0))
-        kernel  = torch.matmul(phi_q, phi_k.transpose(-1,-2)) + self.eps
-        logK    = kernel.log()  # (B,H,S,S)
-
-        # 4) Build and mask scores
-        scores = fq.unsqueeze(-1) + gk.unsqueeze(-2) + logK + extra_score
-        # mask invalid slots (mask may be bool or float -inf)
+        # ——— 4) build & mask scores ———
+        scores = fq.unsqueeze(-1) + gk.unsqueeze(-2) + logK + extra_score  # (B,H,S,S)
         if mask.dtype == torch.bool:
             valid = mask
         else:
             valid = torch.isfinite(mask)
-        drop_val = torch.tensor(-1e9, device=scores.device, dtype=scores.dtype)
-        scores   = scores.masked_fill(~valid, drop_val)
+        scores = scores.masked_fill(~valid, -1e9)
 
-        # 5) Tempered log-sum-exp hull
-        tau_exp = tau.expand(-1, -1, -1, S)   # (B,H,S,S)
-        v_exp   = v.unsqueeze(-2)             # (B,H,1,S,D)
+        # ——— 5) 4-D tempered LSE hull ———
+        tau4 = tau.squeeze(-1)                # (B,H,S)
+        scaled = scores * tau4.unsqueeze(-1)  # (B,H,S,S)
 
-        scaled    = scores.unsqueeze(-1) * tau_exp.unsqueeze(-1) + v_exp
-        m_scaled, _ = scaled.max(dim=-2, keepdim=True)
-        shifted     = scaled - m_scaled
-        lse         = m_scaled.squeeze(-2) + torch.logsumexp(shifted, dim=-2)
-        out         = lse / tau                 # (B,H,S,D)
+        m, _      = scaled.max(dim=-1, keepdim=True)                     # (B,H,S,1)
+        exp_s     = torch.exp(scaled - m)                                 # (B,H,S,S)
+        exp_s     = exp_s.masked_fill(~valid, 0.0)                        # zero out masked
+        denom     = exp_s.sum(dim=-1, keepdim=True).clamp(min=self.eps)   # (B,H,S,1)
+        weights   = exp_s / denom                                          # (B,H,S,S)
 
-        return out
-
+        # ——— 6) single batched bmm for output ———
+        w_mat = weights.reshape(B * H, S, S)  # (B*H, S, S)
+        v_mat = v.reshape(B * H, S, D)        # (B*H, S, D)
+        out   = w_mat.bmm(v_mat)              # (B*H, S, D)
+        return out.reshape(B, H, S, D)
+        
 class InterleavedPhaseChannelizer(nn.Module):
     """
     Embedding shape: (B, T, 2*M) == [c0, ϕ0, c1, ϕ1, ..., c_{M-1}, ϕ_{M-1}].
@@ -566,7 +548,7 @@ class InterleavedPhaseChannelizer(nn.Module):
 #   Pairwise Hull Attention (mask‑aware)
 # ----------------------------------------------------------------------
 class PairwiseHullAttention(nn.Module):
-    def __init__(self, embed_dim, heads, use):
+    def __init__(self, embed_dim, heads,moe_petals, use):
         super().__init__()
         assert embed_dim % heads == 0, "embed_dim must be divisible by heads"
         self.embed_dim = embed_dim
@@ -576,7 +558,7 @@ class PairwiseHullAttention(nn.Module):
             self.pre = S4PreMix(embed_dim, heads)
         else:
             self.pre = LinearPreMix(embed_dim, heads)
-        self.mixer = ConvexMixer(self.d_k, min(1 + self.d_k // 16, heads), self.d_k*2)#dont need many for scoring
+        self.mixer = ConvexMixer(self.d_k, moe_petals, self.d_k*2)#dont need many for scoring
         self.pos = ConvexPositionalBias(heads)
         self.W_O = nn.Linear(embed_dim, embed_dim, bias=False)
         self.phase = InterleavedPhaseChannelizer(embed_dim)
@@ -613,8 +595,8 @@ class PairwiseHullAttention(nn.Module):
 class OmniHullBlock(nn.Module):
     def __init__(self, dim, heads, moe_petals, use=0):
         super().__init__()
-        self.attn = PairwiseHullAttention(dim, heads, use=use)
-        self.hff  = VectorHull(dim, [dim * 2], petals=moe_petals)
+        self.attn = PairwiseHullAttention(dim, heads, moe_petals, use=use)
+        self.hff  = VectorHull(dim, petals=moe_petals)
         self.ln1, self.ln2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
         self.a1, self.a2   = nn.Parameter(torch.zeros(())), nn.Parameter(torch.zeros(()))
 
