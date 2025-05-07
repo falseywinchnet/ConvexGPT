@@ -15,7 +15,10 @@
 * 3: excepting S4D, Lower-precision friendly and higher robustness to adversarial or out-of-distribution input
 * 4: no sequential bottlenecks from scaling
 * 5: Extreme Nonlinear separability
-* 6: Lipschitz is tight, jacobian positive semidefinite, all information lives on hyperplanes
+* 6: Lipschitz is tight, jacobian positive semidefinite, satisfies Jensen's inequality
+* 7: It is differentiable everywhere in its domain. Its derivative is continuous everywhere.
+
+Its derivative is continuous everywhere.
 
 ---
 
