@@ -1,5 +1,6 @@
 #copyright joshuah.rainstar@gmail.com 2025
 #protected under ConvexGPT license and copyright -proprietary software
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,7 +9,7 @@ from pathlib import Path
 from typing import List,Literal
 
 #c1 everywhere BUT logsumexp because of the max
-#actually faster, better than ConvexGPT in all respects, but needs more memory
+#yes, efficient,Kolmogorov-Arnold Networks without quadratic explosion, delivered here
         
 class S4DFFT(nn.Module):
     """
@@ -182,6 +183,181 @@ class LinearPreMix(nn.Module):
         return q, k, v
 
 
+
+'''
+Canonical φ(x) builds φ ∈ ℝ^{B, D_in, K}.
+
+When K=8, D_in=8192, B=128 → φ alone = 8.3M floats.
+FFT variant avoids this explicit K-expansion and instead processes one padded array per batch element (ℝ^{B, L} and L ≈ D_in).
+caveat: it must be trained. it varies by d_in only. so you need pre-learned kernels.
+in practice the error is fairly contained. 
+
+naively, our cost is O(N * D_in * D_in*2 * K) for this model since d_out is always twice d_in and K is always 8:
+that's a quadratic term times 16: O(N*embed_dim^2*16).
+This fft form scales as : O(N * D_in * (log D_in + K))
+In practice, this converges on quasi-linear growth and enables much more massive KAN utilization with minimal cost, provided
+you pre-learn the kernels. however, since x varies, how do you prelearn the kernel? simple. you zero-mean it. this ensures the kernels are scale invariant.
+This means our more economical KAN module can be quickly instantiated with desired behaviors that approximate nonlinear transformations.
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import time
+
+# Configuration
+D_in = 64
+D_out = 128
+K = 8
+batch_size = 128
+epochs = 5000
+lr = 0.5
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def wolf_update(p: torch.Tensor,
+                g: torch.Tensor,
+                state_p: torch.Tensor,
+                lr: float):
+    # define your constants here instead of capturing them
+    etcerta: float = 0.367879441
+    et:      float = 1.0 - etcerta
+
+    # same logic as before
+    update    = state_p * et + g * etcerta
+    new_state = state_p * et + update * etcerta
+    sign_agree = torch.sign(update) * torch.sign(g)
+    update    = update + (torch.rand_like(update)*2 - 1) * etcerta * update
+    p_new     = torch.where(sign_agree > 0, p - lr * update, p)
+    return p_new, new_state
+from torch.optim.optimizer import Optimizer
+class Wolf(Optimizer):
+    def __init__(self, params, lr=1e-3):
+        defaults = dict(lr=lr)
+        super().__init__(params, defaults)
+        for group in self.param_groups:
+            for p in group['params']:
+                self.state[p]['p'] = torch.zeros_like(p)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+        for group in self.param_groups:
+            lr = group['lr']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                state_p = self.state[p]['p']
+                p_new, new_state = wolf_update(p.data, p.grad, state_p, lr)
+                p.data.copy_(p_new)
+                state_p.copy_(new_state)
+        return loss
+
+class FixedLayerNorm(nn.Module):
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.dim = dim
+
+    def forward(self, x):
+        mean = x.mean(dim=-1, keepdim=True)
+        std = x.std(dim=-1, keepdim=True)
+        return (x - mean) / (std + self.eps)
+
+# Canonical φ(x) with fixed shifts
+class CanonicalPhi(nn.Module):
+    def __init__(self, shifts, W, b, D_in):
+        super().__init__()
+        self.shifts = shifts
+        self.W = W
+        self.b = b
+        self.norm = FixedLayerNorm(D_in)
+
+    def forward(self, x):
+        x_norm = self.norm(x)  # Normalize x
+        xb = x_norm.unsqueeze(-1) + self.shifts.view(1, 1, K)  # (N, D_in, K)
+        phi = F.softplus(xb)  # (N, D_in, K)
+        return torch.einsum("nik,dik->nd", phi, self.W) + self.b  # (N, D_out)
+
+
+
+# FFT encoder with decoder (trainable linear layer)
+class FFTSharedKFilters(nn.Module):
+    def __init__(self, K_shifts, D_in, shifts_values):
+        super().__init__()
+        self.K_shifts = K_shifts
+        self.D_in = D_in
+        self.D_out = 2 * D_in
+        self.L = D_in
+        self.Lf = self.L // 2 + 1
+
+        self.log_amp_shifts = nn.Parameter(torch.randn(self.K_shifts, self.Lf) * 0.01)
+        self.phase_shifts = nn.Parameter(torch.randn(self.K_shifts, self.Lf) * 0.01)
+        self.final_bias = nn.Parameter(torch.zeros(self.D_out))
+        self.norm = FixedLayerNorm(D_in)  # Apply normalization
+
+    def forward(self, x):
+        N = x.shape[0]
+        x_norm = self.norm(x)  # Normalize x
+
+        Xf = torch.fft.rfft(x_norm, n=self.L, dim=-1)  # (N, Lf)
+        Kf_shifts = torch.exp(self.log_amp_shifts) * torch.exp(-1j * self.phase_shifts)
+        Yf_k = Xf.unsqueeze(1) * Kf_shifts.unsqueeze(0)  # (N, K_shifts, Lf)
+        x_time_k = torch.fft.irfft(Yf_k, n=self.L, dim=-1)  # (N, K_shifts, D_in)
+        phi_k_d = F.softplus(x_time_k)  # (N, K_shifts, D_in)
+        S_n_learned = phi_k_d.sum(dim=[1, 2])  # (N,)
+        return S_n_learned.unsqueeze(-1) + self.final_bias.unsqueeze(0)  # (N, D_out)
+        
+        return pred
+
+shifts = torch.linspace(0.0, 1.0, 8).to(device)
+
+# Initialize models and training targets
+fft_model = FFTSharedKFilters(8, D_in, D_out).to(device)
+W_ref = nn.Parameter(torch.ones(D_out, D_in, 8), requires_grad=False).to(device)
+b_ref = nn.Parameter(torch.zeros(D_out), requires_grad=False).to(device)
+canonical_phi_model = CanonicalPhi(shifts, W_ref, b_ref, D_in).to(device)
+
+opt = torch.optim.AdamW(fft_model.parameters(), lr=3e-2)
+losses = []
+
+start_time = time.time()
+for epoch in range(1, epochs + 1):
+    x = torch.randn(batch_size, D_in, device=device)
+    with torch.no_grad():
+        target  = canonical_phi_model(x)
+
+    pred = fft_model(x)
+    loss = F.mse_loss(pred, target)
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    losses.append(loss.item())
+    if epoch % 50 == 0 or epoch == 1:
+        print(f"Epoch {epoch}, loss {loss.item():.4e}")
+end_time = time.time()
+
+
+# Plot training loss
+plt.figure(figsize=(10, 6))
+plt.plot(losses, label="FFT Encoder + Linear")
+plt.yscale("log")
+plt.xlabel("Epoch")
+plt.ylabel("MSE Loss")
+plt.title("Training FFT Encoder to Match φ(x) with Trainable Linear Layer")
+plt.grid(True)
+plt.legend()
+plt.show()
+
+# Report parameters
+param_count = sum(p.numel() for p in fft_model.parameters())
+print(f"Trainable parameters: {param_count}")
+print(f"Training time: {end_time - start_time:.2f} seconds")
+
+
+
+
+
+'''
 class KCN(nn.Module):
     def __init__(self, in_dim: int, petals: int, out_dim: int = None):
         super().__init__()
@@ -195,10 +371,10 @@ class KCN(nn.Module):
         # we'll later flatten the last two dims to match BatchedICNN’s use of bmm
         self.weight = nn.Parameter(
             torch.stack([
-                self._init_weight(petals, D_out, D_in) for _ in range(self.k )
-            ], dim=-1)  # shape: (P, D_out, D_in, k)
+                self._init_weight(1, D_out, D_in)[0] for _ in range(self.k)
+            ], dim=-1)  # shape: (D_out, D_in, k)
         )
-        self.bias   = nn.Parameter(torch.zeros(petals, D_out))
+        self.bias = nn.Parameter(torch.zeros(D_out))
 
 
         self.weight2 = nn.Parameter(self._init_weight(petals, D_out, D_out))
@@ -240,15 +416,17 @@ class KCN(nn.Module):
         phi = F.softplus(xb)                           # (N, D_in, k)
 
         # flatten φ for bmm
-        phi_flat = phi.reshape(N, self.in_dim * self.k)        # (N, D_in * k)
+        # reshape to (N, D_in * k)
+        phi_flat = phi.reshape(N, self.in_dim * self.k)  
 
-        # prepare weights
-        weight_flat = self.weight.reshape(self.P, self.out_dim, self.in_dim * self.k).transpose(1, 2)  # (P, D_in*k, D_out)
-        phi_expanded = phi_flat.unsqueeze(0).expand(self.P, N, self.in_dim * self.k)                   # (P, N, D_in*k)
+        # reshape weight to (D_in * k, D_out)
+        weight_flat = self.weight.reshape(self.in_dim * self.k, self.out_dim)
 
-        # ------------------------------------------------------------
-        # 2) first projection
-        x_proj = torch.bmm(phi_expanded, weight_flat) + self.bias.unsqueeze(1)  # (P, N, D_out)
+        # shared projection
+        x_proj_shared = phi_flat @ weight_flat + self.bias  # (N, D_out)
+
+        # duplicate to all petals
+        x_proj = x_proj_shared.unsqueeze(0).expand(self.P, N, self.out_dim)  # (P, N, D_out)
         g1 = torch.sigmoid(self.gate_raw).view(self.P, 1, 1)
         z0 = self.act(x_proj * g1)  # (P, N, D_out)
 
@@ -270,7 +448,7 @@ class KCN(nn.Module):
         z_final = self.act(z1 + x_res) + self.output_bias.unsqueeze(1)       # (P, N, D_out)
         out = z_final.permute(1, 0, 2)                                       # (N, P, D_out)
         new_shape = list(orig[:-1]) + [self.P, self.out_dim]
-        return out.reshape(new_shape)
+        return out.reshape(new_shape)      
 
 
 class ConvexGate(nn.Module):
@@ -692,4 +870,5 @@ class ConvexGPT(nn.Module):
         x = self.ln_f(x)                             # (B, S, embed_dim)
         logits = self.head(x)                        # (B, S, vocab_size)
         return logits
+
 
