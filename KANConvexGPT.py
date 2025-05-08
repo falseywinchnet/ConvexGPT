@@ -198,6 +198,7 @@ This fft form scales as : O(N * D_in * (log D_in + K))
 In practice, this converges on quasi-linear growth and enables much more massive KAN utilization with minimal cost, provided
 you pre-learn the kernels. however, since x varies, how do you prelearn the kernel? simple. you zero-mean it. this ensures the kernels are scale invariant.
 This means our more economical KAN module can be quickly instantiated with desired behaviors that approximate nonlinear transformations.
+secondly, use fixed scales. in principle, this is a reasonable configuration.
 
 import torch
 import torch.nn as nn
