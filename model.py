@@ -875,20 +875,15 @@ class OmniHullBlock(nn.Module):
         super().__init__()
         self.attn = PairwiseHullAttention(dim, heads, moe_petals, use=use)
         self.hff  = VectorHull(dim, moe_petals)
-        self.hff2 = VectorHull(dim, moe_petals)
 
         self.ln1, self.ln2,self.ln3 = nn.LayerNorm(dim), nn.LayerNorm(dim), nn.LayerNorm(dim)
-        self.a1, self.a2   = nn.Parameter(torch.zeros(())), nn.Parameter(torch.zeros(()))
-
-    def _mix(self, x, y):
-        return 0.9 * x + 0.1 * y
 
     def forward(self, x: torch.Tensor, mask=None):
         x1 ,attn_scores = self.attn(self.ln1(x), mask)
-        x1 = self.hff(self.ln2(x1))
-        x1 = self._mix(x1,x)
-
-        return x1,attn_scores
+        x = x + x1
+        x1 = self.hff(self.ln2(x))
+        x = x + x1
+        return x,attn_scores
 
 # ----------------------------------------------------------------------
 #   GPT Wrapper with Causal Mask
