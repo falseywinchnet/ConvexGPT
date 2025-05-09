@@ -9,10 +9,7 @@ from pathlib import Path
 from typing import List,Literal
 
 #c1 everywhere BUT logsumexp because of the max
-#ok, finally got convex, good, correct masking, phase contributions, channel information
-#not leaking future into the past anymore! lol!
-#optional, high efficiency KAN front end devised that actually has a lot faster fit to some problems
-#more testing on it is needed to be sure if it is good
+
         
 class S4DFFT(nn.Module):
     """
@@ -256,271 +253,88 @@ class BatchedICNN(nn.Module):
         new_shape = lead_dims + [self.P, self.in_dim]  # [B, H, T, P, D]
         return out.reshape(new_shape)
 
-'''
-Canonical φ(x) builds φ ∈ ℝ^{B, D_in, K}.
 
-When K=8, D_in=8192, B=128 → φ alone = 8.3M floats.
-FFT variant avoids this explicit K-expansion and instead processes one padded array per batch element (ℝ^{B, L} and L ≈ D_in).
-caveat: it must be trained. it varies by d_in only. so you need pre-learned kernels.
-in practice the error is fairly contained. 
-
-naively, our cost is O(N * D_in * D_in*2 * K) for this model since d_out is always twice d_in and K is always 8:
-that's a quadratic term times 16: O(N*embed_dim^2*16).
-This fft form scales as : O(N * D_in * (log D_in + K))
-In practice, this converges on quasi-linear growth and enables much more massive KAN utilization with minimal cost, provided
-you pre-learn the kernels. however, since x varies, how do you prelearn the kernel? simple. you zero-mean it. this ensures the kernels are scale invariant.
-This means our more economical KAN module can be quickly instantiated with desired behaviors that approximate nonlinear transformations.
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import time
-
-# Configuration
-D_in = 64
-D_out = 128
-K = 8
-batch_size = 128
-epochs = 5000
-lr = 0.5
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-def wolf_update(p: torch.Tensor,
-                g: torch.Tensor,
-                state_p: torch.Tensor,
-                lr: float):
-    # define your constants here instead of capturing them
-    etcerta: float = 0.367879441
-    et:      float = 1.0 - etcerta
-
-    # same logic as before
-    update    = state_p * et + g * etcerta
-    new_state = state_p * et + update * etcerta
-    sign_agree = torch.sign(update) * torch.sign(g)
-    update    = update + (torch.rand_like(update)*2 - 1) * etcerta * update
-    p_new     = torch.where(sign_agree > 0, p - lr * update, p)
-    return p_new, new_state
-from torch.optim.optimizer import Optimizer
-class Wolf(Optimizer):
-    def __init__(self, params, lr=1e-3):
-        defaults = dict(lr=lr)
-        super().__init__(params, defaults)
-        for group in self.param_groups:
-            for p in group['params']:
-                self.state[p]['p'] = torch.zeros_like(p)
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = closure() if closure is not None else None
-        for group in self.param_groups:
-            lr = group['lr']
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                state_p = self.state[p]['p']
-                p_new, new_state = wolf_update(p.data, p.grad, state_p, lr)
-                p.data.copy_(p_new)
-                state_p.copy_(new_state)
-        return loss
-
-class FixedLayerNorm(nn.Module):
-    def __init__(self, dim, eps=1e-5):
+class PositiveLinearHK(nn.Module): #Hoedt–Klambauer MUST be used always
+    def __init__(self, d_in, d_out, bias=True):
         super().__init__()
-        self.eps = eps
-        self.dim = dim
+        self.raw = nn.Parameter(torch.empty(d_out, d_in))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(d_out))
+        else:
+            self.register_parameter('bias', None)
+        with torch.no_grad():
+            mean = math.log(math.sqrt(2.0 / d_in))
+            nn.init.normal_(self.raw, mean=mean, std=0.2)
+
+    @property
+    def weight(self):
+        return F.softplus(self.raw).pow(2)  # ensures strict positivity
 
     def forward(self, x):
-        mean = x.mean(dim=-1, keepdim=True)
-        std = x.std(dim=-1, keepdim=True)
-        return (x - mean) / (std + self.eps)
+        return F.linear(x, self.weight, self.bias)
 
-# Canonical φ(x) with fixed shifts
-class CanonicalPhi(nn.Module):
-    def __init__(self, shifts, W, b, D_in):
-        super().__init__()
-        self.shifts = shifts
-        self.W = W
-        self.b = b
-        self.norm = FixedLayerNorm(D_in)
-
-    def forward(self, x):
-        x_norm = self.norm(x)  # Normalize x
-        xb = x_norm.unsqueeze(-1) + self.shifts.view(1, 1, K)  # (N, D_in, K)
-        phi = F.softplus(xb)  # (N, D_in, K)
-        return torch.einsum("nik,dik->nd", phi, self.W) + self.b  # (N, D_out)
-
-
-
-# FFT encoder with decoder (trainable linear layer)
-class FFTSharedKFilters(nn.Module):
-    def __init__(self, K_shifts, D_in, shifts_values):
-        super().__init__()
-        self.K_shifts = K_shifts
-        self.D_in = D_in
-        self.D_out = 2 * D_in
-        self.L = D_in
-        self.Lf = self.L // 2 + 1
-
-        self.log_amp_shifts = nn.Parameter(torch.randn(self.K_shifts, self.Lf) * 0.01)
-        self.phase_shifts = nn.Parameter(torch.randn(self.K_shifts, self.Lf) * 0.01)
-        self.final_bias = nn.Parameter(torch.zeros(self.D_out))
-        self.norm = FixedLayerNorm(D_in)  # Apply normalization
-
-    def forward(self, x):
-        N = x.shape[0]
-        x_norm = self.norm(x)  # Normalize x
-
-        Xf = torch.fft.rfft(x_norm, n=self.L, dim=-1)  # (N, Lf)
-        Kf_shifts = torch.exp(self.log_amp_shifts) * torch.exp(-1j * self.phase_shifts)
-        Yf_k = Xf.unsqueeze(1) * Kf_shifts.unsqueeze(0)  # (N, K_shifts, Lf)
-        x_time_k = torch.fft.irfft(Yf_k, n=self.L, dim=-1)  # (N, K_shifts, D_in)
-        phi_k_d = F.softplus(x_time_k)  # (N, K_shifts, D_in)
-        S_n_learned = phi_k_d.sum(dim=[1, 2])  # (N,)
-        return S_n_learned.unsqueeze(-1) + self.final_bias.unsqueeze(0)  # (N, D_out)
-        
-        return pred
-
-shifts = torch.linspace(0.0, 1.0, 8).to(device)
-
-# Initialize models and training targets
-fft_model = FFTSharedKFilters(8, D_in, D_out).to(device)
-W_ref = nn.Parameter(torch.ones(D_out, D_in, 8), requires_grad=False).to(device)
-b_ref = nn.Parameter(torch.zeros(D_out), requires_grad=False).to(device)
-canonical_phi_model = CanonicalPhi(shifts, W_ref, b_ref, D_in).to(device)
-
-opt = torch.optim.AdamW(fft_model.parameters(), lr=3e-2)
-losses = []
-
-start_time = time.time()
-for epoch in range(1, epochs + 1):
-    x = torch.randn(batch_size, D_in, device=device)
-    with torch.no_grad():
-        target  = canonical_phi_model(x)
-
-    pred = fft_model(x)
-    loss = F.mse_loss(pred, target)
-    opt.zero_grad()
-    loss.backward()
-    opt.step()
-    losses.append(loss.item())
-    if epoch % 50 == 0 or epoch == 1:
-        print(f"Epoch {epoch}, loss {loss.item():.4e}")
-end_time = time.time()
-
-
-# Plot training loss
-plt.figure(figsize=(10, 6))
-plt.plot(losses, label="FFT Encoder + Linear")
-plt.yscale("log")
-plt.xlabel("Epoch")
-plt.ylabel("MSE Loss")
-plt.title("Training FFT Encoder to Match φ(x) with Trainable Linear Layer")
-plt.grid(True)
-plt.legend()
-plt.show()
-
-# Report parameters
-param_count = sum(p.numel() for p in fft_model.parameters())
-print(f"Trainable parameters: {param_count}")
-print(f"Training time: {end_time - start_time:.2f} seconds")
-
-
-
-
-
-'''
 class KCN(nn.Module):
     def __init__(self, in_dim: int, petals: int, out_dim: int = None):
         super().__init__()
         self.in_dim  = in_dim
         self.out_dim = out_dim if out_dim is not None else in_dim
-        self.P       = petals
-        self.k       = 8 #empirically and theoretically, shouldnt exceed min(batch,petals), not important
+        self.P = petals
+        self.k = 8
         D_in, D_out = self.in_dim, self.out_dim
 
-        # — edge-wise basis weights — (P, D_out, D_in, k)
-        # we'll later flatten the last two dims to match BatchedICNN’s use of bmm
-        self.weight = nn.Parameter(
-            torch.stack([
-                self._init_weight(1, D_out, D_in)[0] for _ in range(self.k)
-            ], dim=-1)  # shape: (D_out, D_in, k)
-        )
-        self.bias = nn.Parameter(torch.zeros(D_out))
+        # 1. Shared Positive Basis Projection φ(x) → D_out
+        self.phi_proj = PositiveLinearHK(D_in * self.k, D_out)
 
-
-        self.weight2 = nn.Parameter(self._init_weight(petals, D_out, D_out))
-        self.bias2   = nn.Parameter(torch.zeros(petals, D_out))
+        # 2. Petal-wise second projection weights: Positive via HK
+        self.raw_weight2 = nn.Parameter(torch.empty(petals, D_out, D_out))
+        with torch.no_grad():
+            mean = math.log(math.sqrt(2.0 / D_out))
+            nn.init.normal_(self.raw_weight2, mean=mean, std=0.2)
+        self.bias2 = nn.Parameter(torch.zeros(petals, D_out))
         self.gate_raw2 = nn.Parameter(torch.full((petals,), -3.0))
 
-        # shared Softplus shifts: shape (1, D_in, k)
-        shifts = torch.linspace(-1.0, 1.0, self.k ).view(1, 1, self.k )  # shape: (1, 1, k)
-        self.register_buffer("shifts", shifts)              # broadcast when used
+        # 3. Shared Softplus shifts
+        shifts = torch.linspace(-1.0, 1.0, self.k).view(1, 1, self.k)
+        self.register_buffer("shifts", shifts)
 
-        # residual projection exactly like BatchedICNN: (P, 2*D_in, D_out)
+        # 4. Residual connection (linear, may remain unconstrained)
         self.z_weight = nn.Parameter(torch.empty(petals, 2 * D_in, D_out))
         nn.init.kaiming_uniform_(self.z_weight, a=math.sqrt(5))
 
-        # gating scalars per petal
+        # 5. Gate and bias per petal
         self.gate_raw = nn.Parameter(torch.full((petals,), -3.0))
-
-        # final bias per petal/output
         self.output_bias = nn.Parameter(torch.zeros(petals, D_out))
+
         self.act = nn.Softplus()
-   
-    
-    def _init_weight(self, petals: int, d_out: int, d_in: int) -> torch.Tensor:
-        w = torch.empty(petals, d_out, d_in)
-        with torch.no_grad():
-            mean = math.log(math.sqrt(2.0 / d_in))
-            nn.init.normal_(w, mean=mean, std=0.2)
-        return w
-        
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (..., D_in)
         orig = x.shape
-        x_flat = x.reshape(-1, self.in_dim)       # (N, D_in)
+        x_flat = x.reshape(-1, self.in_dim)
         N = x_flat.size(0)
 
-        # ------------------------------------------------------------
-        # 1) compute basis activations φ(x): (N, D_in, k)
-        xb  = x_flat.unsqueeze(-1) + self.shifts       # (N, D_in, k)
-        phi = F.softplus(xb)                           # (N, D_in, k)
+        xb = x_flat.unsqueeze(-1) + self.shifts
+        phi = F.softplus(xb)
+        phi_flat = phi.reshape(N, self.in_dim * self.k)
 
-        # flatten φ for bmm
-        # reshape to (N, D_in * k)
-        phi_flat = phi.reshape(N, self.in_dim * self.k)  
-
-        # reshape weight to (D_in * k, D_out)
-        weight_flat = self.weight.reshape(self.in_dim * self.k, self.out_dim)
-
-        # shared projection
-        x_proj_shared = phi_flat @ weight_flat + self.bias  # (N, D_out)
-
-        # duplicate to all petals
-        x_proj = x_proj_shared.unsqueeze(0).expand(self.P, N, self.out_dim)  # (P, N, D_out)
+        x_proj_shared = self.phi_proj(phi_flat)
+        x_proj = x_proj_shared.unsqueeze(0).expand(self.P, N, self.out_dim)
         g1 = torch.sigmoid(self.gate_raw).view(self.P, 1, 1)
-        z0 = self.act(x_proj * g1)  # (P, N, D_out)
+        z0 = self.act(x_proj * g1)
 
-        # ------------------------------------------------------------
-        # 3) second projection
-        w2 = F.softplus(self.weight2).pow(2).transpose(1, 2)  # (P, D_out, D_out)
-        z1 = torch.bmm(z0, w2) + self.bias2.unsqueeze(1)      # (P, N, D_out)
+        # Apply softplus^2 to ensure positivity of second weights
+        w2 = F.softplus(self.raw_weight2).pow(2).transpose(1, 2)
+        z1 = torch.bmm(z0, w2) + self.bias2.unsqueeze(1)
         g2 = torch.sigmoid(self.gate_raw2).view(self.P, 1, 1)
         z1 = self.act(z1 * g2)
 
-        # ------------------------------------------------------------
-        # 4) residual projection
-        x_res_in = torch.cat([x_flat, x_flat], dim=-1)                       # (N, 2*D_in)
-        x_res_exp = x_res_in.unsqueeze(0).expand(self.P, N, 2 * self.in_dim)  # (P, N, 2*D_in)
-        x_res = torch.bmm(x_res_exp, self.z_weight)                          # (P, N, D_out)
+        x_res_in = torch.cat([x_flat, x_flat], dim=-1)
+        x_res_exp = x_res_in.unsqueeze(0).expand(self.P, N, 2 * self.in_dim)
+        x_res = torch.bmm(x_res_exp, self.z_weight)
 
-        # ------------------------------------------------------------
-        # 5) combine and output
-        z_final = self.act(z1 + x_res) + self.output_bias.unsqueeze(1)       # (P, N, D_out)
-        out = z_final.permute(1, 0, 2)                                       # (N, P, D_out)
+        z_final = self.act(z1 + x_res) + self.output_bias.unsqueeze(1)
+        out = z_final.permute(1, 0, 2)
         new_shape = list(orig[:-1]) + [self.P, self.out_dim]
-        return out.reshape(new_shape)      
+        return out.reshape(new_shape)   
 
 
 class ConvexGate(nn.Module):
@@ -529,7 +343,7 @@ class ConvexGate(nn.Module):
     """
     def __init__(self, in_dim: int):
         super().__init__()
-        self.lin = nn.Linear(in_dim, 1, bias=True)
+        self.lin = PositiveLinearHK(in_dim, 1, bias=True)
         self.softplus = nn.Softplus()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -573,7 +387,7 @@ class ScalarHull(nn.Module):
         self.in_dim = in_dim
         self.register_buffer('nu',  torch.tensor(1.64872127070012814684865078781416357165))
         self.register_buffer('noise_scale', torch.tensor(1e-5))
-        self.petals = BatchedICNN(self.in_dim, petals)
+        self.petals = KCN(self.in_dim, petals)
         self.gate   = ConvexGate(in_dim)
         self.register_buffer("creative", torch.tensor(True))
         self.register_buffer('eps', torch.tensor(1e-6))
@@ -612,7 +426,7 @@ class VectorHull(nn.Module):
         self.in_dim = dim
         self.out_dim = out_dim if out_dim is not None else dim
         self.register_buffer('noise_scale', torch.tensor(1e-5))
-        self.petals = BatchedICNN(self.in_dim, petals)
+        self.petals = KCN(self.in_dim, petals)
         self.gate   = ConvexGate(dim)
         self.register_buffer("creative", torch.tensor(True))
         self.register_buffer('eps', torch.tensor(1e-6))
@@ -661,7 +475,7 @@ class ConvexMixer(nn.Module):
         self.register_buffer('creative', torch.tensor(True))
         self.fused = FusedLogSumExp(dim=-1)
 
-    def forward(self, q, k, v, mask):
+    def forward(self, q, k, v, mask,mask_back):
         B, H, S, D = q.shape
         device = q.device
 
@@ -693,7 +507,7 @@ class ConvexMixer(nn.Module):
         logK = self.fused(sum_ab).squeeze(-1)                        # (B,H,S,S)
 
         # 5) Assemble logits with mask and temperature
-        log_mask = torch.log(mask.clamp_min(self.eps))  # convert to log-domain
+        log_mask = torch.log(mask_back.clamp_min(self.eps))  # convert to log-domain
         scores = fq.unsqueeze(-1) + gk.unsqueeze(-2) + logK + log_mask  # additive
         
         logits = scores * tau.squeeze(-1).unsqueeze(-1)
@@ -851,7 +665,7 @@ class PairwiseHullAttention(nn.Module):
         self.register_buffer("creative", torch.tensor(True))
         self.rope = ConvexRoPE(self.d_k)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None,mask_back=None):
         self.phase(x,mask) #apply in-place positional phasing
         B, S, E = x.shape
         Q, K, V= self.pre(x)
@@ -862,7 +676,7 @@ class PairwiseHullAttention(nn.Module):
         std  = 0.5 * (Q.std()  + K.std())
         Q = (Q - mean) / std
         K = (K - mean) / std        
-        y,attn_scores = self.mixer(Q, K, V, mask=mask)
+        y,attn_scores = self.mixer(Q, K, V, mask=mask,mask_back=mask_back)
         
         y = y.transpose(1, 2).reshape(B, S, self.embed_dim)
         return self.W_O(y), attn_scores
@@ -877,9 +691,10 @@ class OmniHullBlock(nn.Module):
         self.hff  = VectorHull(dim, moe_petals)
 
         self.ln1, self.ln2,self.ln3 = nn.LayerNorm(dim), nn.LayerNorm(dim), nn.LayerNorm(dim)
+        self.a1, self.a2   = nn.Parameter(torch.zeros(())), nn.Parameter(torch.zeros(()))
 
-    def forward(self, x: torch.Tensor, mask=None):
-        x1 ,attn_scores = self.attn(self.ln1(x), mask)
+    def forward(self, x: torch.Tensor, mask=None,mask_back=None):
+        x1 ,attn_scores = self.attn(self.ln1(x), mask,mask_back)
         x = x + x1
         x1 = self.hff(self.ln2(x))
         x = x + x1
@@ -912,7 +727,7 @@ class ConvexGPT(nn.Module):
             self.embed_dim,
             heads,
             moe_petals,
-            use=1 if i == 0 or i == depth - 1 else 0
+            use=1
                   )
             for i in range(depth)
         ])
@@ -940,6 +755,25 @@ class ConvexGPT(nn.Module):
         mask = torch.where(j <= i, torch.ones_like(decay), decay)
         mask = mask.clamp(min=eps)
         return mask  # shape (S, S)
+        
+    @staticmethod
+    def reversed_logistic_mask(S: int, eps: float = 1e-17) -> torch.Tensor:
+            i = torch.arange(S).unsqueeze(1).float()  # (S,1)
+            j = torch.arange(S).unsqueeze(0).float()  # (1,S)
+        
+            # Compute normalized past offset u = (i - j) / (i + 1)
+            diff = (i - j).clamp(min=0.0)  # zero if j ≥ i (future)
+            horizon = (i + 1).clamp(min=1.0)  # prevent division by zero
+            u = (diff / horizon).clamp(max=1.0)
+        
+            # Smooth decay from 1 to eps as we move into the past
+            decay = torch.exp(1.0 - 1.0 / (1.0 - u ** 2 + 1e-6))
+            decay = decay.clamp_max(1.0)
+        
+            # Build mask: decay for j < i (past), 1 for j ≥ i (future including present)
+            mask = torch.where(j >= i, torch.ones_like(decay), decay)
+            mask = mask.clamp(min=eps)
+            return mask  # shape (S, S)
 
     def set_creativity(self, value: bool):
         val = torch.tensor(value)
@@ -964,11 +798,13 @@ class ConvexGPT(nn.Module):
         x = torch.stack([embeddings, torch.zeros_like(self.token_emb(idx))], dim=-1).reshape(idx.shape[0], idx.shape[1], 2 * self.token_emb.embedding_dim)
 
         # 3) build causal mask
+        mask_back = self.reversed_logistic_mask(S)          # (1, 1, S, S)
         mask = self.logistic_mask(S)          # (1, 1, S, S)
+
         attn_scores = []
         # 4) apply each block (which will write φ into odd slots)
         for blk in self.blocks:
-            x,attn_temp = blk(x, mask)
+            x,attn_temp = blk(x, mask,mask_back)
             attn_scores.append(attn_temp)
 
         attn_scores =  torch.stack(attn_scores).mean(dim=0)#divide by heads
