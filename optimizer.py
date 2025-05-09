@@ -38,9 +38,9 @@ def direwolf_update(p: torch.Tensor,
     g_new     =  -lr * update
     return g_new, new_state
 class Direwolf(Optimizer):
-        def __init__(self, params, lr=1e-3):
+        def __init__(self, model, lr=1e-3):
             defaults = dict(lr=lr)
-            super().__init__(params, defaults)
+            super().__init__(model, defaults)
             self.model = model
             self.state = {}
             self.lr = lr
