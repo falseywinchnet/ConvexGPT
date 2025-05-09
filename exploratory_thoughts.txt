@@ -1,4 +1,92 @@
+
+problem of epistemic stability under parameter updates — a consolidation-versus-redistribution dilemma.  a desired inductive bias: new information should localize to new regions of the representation space, without overwriting or diffusing prior stable representations ("truth stays in one place").
+
+This can be reframed as:
+
+Preserve representational locality: learned features should not shift arbitrarily with continued training.
+Avoid representational drift: old knowledge shouldn't be constantly re-encoded elsewhere.
+Encourage compositional expansion: new knowledge gets appended into unused parts of the model, not grafted onto or blended into existing parts.
+
+This is a necessity.
+
+routing sparsity, sadly. is only so achievable.
+But what I could do is set a weight history, and make weights resist retraining.
+this could be done in an inverse manner- the more number of times a weight is adjusted without the gradient sign changing, the more we accumulate a "resistant" value.
+this "resistant" value is stored alongside the data.
+the very first time the model tries to flip with a gradient thats the opposite, it severely dampens the shift, dividing it by resistant. the more times the model moves the "other" way- in other words, doesn't flip again, but continues to try to move away from the previous minima-
+we deplete this resistant but store it in another resistant.
+In other words, we track two directions- because a 1d gradient moves in two dimensions-
+And accumulate or deplete resistance on successive moves.
+
+as the model moves away from the minima, it will then resist being moved back.
+this is sort of like a viscosity thing? we could apply optimal transport theory to this.
+This allows weights to freeze into forms that can readily deform when new patterns emerge.
+there's also elasticity involved. elasticity would take the form of a third and fourth variable.
+ie, when the weight is being pushed around a lot, over iterations, its a hot spot. the hotter a weight is, the more elasticity it should have- it should be hot. fluid. This fluidity would not adjust the viscosity of the first mechanism, rather, it sets the initial flexibility and then the transport viscosity parameters restrict it further. so going into depth- this deeper fluidity set by updates over time- weights cool. in other words, they have a variable with an initial temp, and the temp is ablated over time if the weight isnt moved. as the weight gets colder, it gets harder to move. Thus we have both viscosity that resists being moved back and forth and viscosity that impedes attempts to update weights that have consolidated without strong effort. Once the model's petals have been fully trained, we could apply a per-petal temp divider constant that acts like a cryogenic freezer, causing those petals to be very, very, very hard to shift, without actually clamping anything, thus preserving our convex and c1 properties- models are frozen via chrysalis. 
+We can automatically set this temp divider when a certain percentage of the weights in a petal are established, and automatically adjust the model to add more petals when a certain percentage of petals are frozen. there's probably statistical theory here. student-t with 1/e governs the ideal partitioning of noise to signal, but i forget what the actual partition there is in terms of statistical distribution.  but we could say, when the petals param elasticity has dropped below the level set as "crystalization"- here drawing on pressure physics and water as steam -> liquid -> crystal - in other words inferring a temp to mean "crystalized" - how many of the atoms in a body of water as a percentage must be below a certain temp for it to form ice, in a vacuum? actually i guess ice doesnt form in a vacuum, not a true one. So we'd have a relationship of pressure to temp. pressure could be said to be the relative force on the weights to change, vs their resistance to change. so we could estimate the learning rate is equal to the pressure, so the pressure is the learning rate, and the temp variable would then be considered against it, and we ask how much force is needed to shift the param at the current temp and learning rate, where that force is considered energy. That would tell us if the atom- or weight in this case- is in a frozen state. Then, if, say, 1-1/e or some other statistical percentage of the atoms- remember earlier i ask how many must be below a temp? if that percentage is reached, we consider the petal frozen and mark it as such. petals can be unfrozen manually by unsetting this, but still must be "warmed". 
+
+Then, we use statistical theory involving 1/(n-1) and the petals to determine if we have enough petals unfrozen, and if not, we expand the model by adding more petals in place to the hull.
+
+
+ increasing the number of heads does affect the coordinate system of representation in a way that can invalidate prior petal specializations, unless constraints are enforced.
+what about making it so only certain embedding channels are always handled by certain heads, and each head and the corresponding hull has a fixed embedding capacity? partitioning in embedding space? that will work.
+
+
+Let:
+
+embed_dim = E
+
+num_heads = H
+
+Fix d_k = E / H
+
+Each head h ∈ [0, H-1] is responsible for x[..., h*d_k : (h+1)*d_k]
+
+Consequences:
+All operations within head h (QKV projection, scoring, petal activation, etc.) operate only on its own channel slice.
+
+No mixing of representation across heads in x.
+
+No redistribution of learned features unless explicitly done.
+
+This defines a static, spatial routing policy: channels c ∈ [h*d_k, (h+1)*d_k] ↔ head h ↔ petals in ScalarHull_h.
+
+Advantages
+Petal Consolidation is Preserved
+
+Because ScalarHull_h only ever sees input from channels h*d_k:(h+1)*d_k, its semantic region is fixed.
+
+Expansion does not affect prior heads.
+
+what this means is we set a fixed embed per head capacity and the number of heads is actually decided by embed dimension. So you can adjust the model's embed dimension to add more capacity.
+but this also means that the embedding layer has to be relearned, as do the vectorhulls, and thus the savings are not great- all you've done is to preserve channel information.
+
+in other words, attention is a projection into a latent space. its actually transformative. 
+Representational capacity is secondary to alignment and separability of the signal.
+learning attention patterns is foundational to a model, fine tuning output is an MLP problem.
+
+in other words, we can assign embed dim, train some petals until fully trained, then lock in and add more petal capacity until we hit the loss we want, and then we can expand embed-dim and add more data to the distribution the model sees- the existing attention *will* see the patterns it thinks it sees, but it will be up to soft routing to deform this into a shape downstream modules can utilize. its ground truth is locked in.
+
+and, we can swap out vectorhulls on different representation problems, or combine their outputs.
+a vectorhull trained for the first 32, and another one trained for the second 32, are then each going to project a respective truth. you can have multiple attention mixers in parallel.
+in fact, this abstraction isnt even needed.
+what you can do is make omnihullblocks only handle a fixed partition of the embed space, and add additional blocks that operate in *parallel* over more embedding space, itself allocated to expanded vocabulary, or a projection. ie, the first layer is a block of 1x1 embedding,
+and that creates a latent representation, and then we use a projector to move this up to a wider bottleneck of twice the size, and split it into two heads, and train one on part of the problem domain, and another on more of the problem domain, to fully utilize capacity. then, in the third layer,
+we need a wider attention module, because we need to combine all scores, and we score all the parallel block outputs which have been transformed in the third layer system in parallel, and thus the third layer learns to elucidate truth from the second. 
+in other words, to grow the model, we recursively create a tree that is also a pyramid:
+we double the second stage, then in the third stage consolidate.
+ if we want to go further, we can double the second stage again, but now, the 3 and 4 block
+go to a second block in the third stage,
+and *those* get combined in the fourth stage, using a block like the one in the third stage.
+this becomes a "block of blocks" which outputs something the same shape as its input but recursively formulated in such a way that linear capacity growth is possible.
+each BoB can be restructured to add capacity by factor of 2 growth, to allow it to adapt to expanded domains.
+
+block of blocks in turn can be stacked in convexgpt to form the base model.
+
+
+
 TODO:
+
 short term, medium term, long term memory *outside* of core modules.
 Integrate more science from my cognitive theory metaphor - mind is a manifold, like the ripples in a body of water when a rock is dropped into them.
 At the center is the input but also the output. memory is stored in the ripples as geometry, used as refraction.
