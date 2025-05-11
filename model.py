@@ -228,7 +228,6 @@ class PositiveLinearHK(nn.Module): #Hoedt–Klambauer MUST be used always
     def forward(self, x):
         return F.linear(x, self.weight, self.bias)
 
-
 class ConvexGate(nn.Module):
     """
     Convex & bounded gate: g(x) = 1 - exp(-softplus(Wx + b)) ∈ (0,1)
@@ -242,142 +241,105 @@ class ConvexGate(nn.Module):
         u = self.softplus(self.lin(x))      # convex, ≥ 0
         return 1.0 - torch.exp(-u)       # convex, ∈ (0,1)
 
-        
-class BatchedICNN(nn.Module):
-    def __init__(self, in_dim: int, petals: int):
+#based on BatchedICNN but with additional stuff inspired by KAN networks.
+
+class PositiveLinear3DHK(nn.Module):
+    """
+    TorchScript-safe version of a positive linear map over petals (P, N, D_in → D_out),
+    using softplus² and optional Frobenius normalization *during training only*.
+    """
+    def __init__(self, petals: int, D_in: int, D_out: int, norm_target: float = None):
         super().__init__()
-        self.in_dim = in_dim
         self.P = petals
-        D = in_dim
-        # layer dims: D → 2D → D
-        self.d1, self.d2 = 2 * D, D
+        self.D_in = D_in
+        self.D_out = D_out
+        self.norm_target = norm_target
 
-        # first-layer weights: (P, d1, D)
-        self.weight_raw_0 = nn.Parameter(self._init_weight(petals, self.d1, D))
-        self.bias_0       = nn.Parameter(torch.zeros(petals, self.d1))
+        self.raw = nn.Parameter(torch.empty(petals, D_out, D_in))
+        self.bias = nn.Parameter(torch.zeros(petals, D_out))
 
-        # second-layer weights: (P, d2, d1)
-        self.weight_raw_1 = nn.Parameter(self._init_weight(petals, self.d2, self.d1))
-        self.bias_1       = nn.Parameter(torch.zeros(petals, self.d2))
-
-        # per-petal residual projection weight: maps 2D → D: shape (P, d1, d2)
-        self.z_weight = nn.Parameter(torch.empty(petals, self.d1, self.d2))
-        nn.init.kaiming_uniform_(self.z_weight, a=math.sqrt(5))
-
-        # gating scalars
-        self.gate_raw_0 = nn.Parameter(torch.full((petals,), -3.0))
-        self.gate_raw_1 = nn.Parameter(torch.full((petals,), -3.0))
-
-        self.output_bias = nn.Parameter(torch.zeros(petals, D))
-        self.act = nn.Softplus()
-
-    def _init_weight(self, petals: int, d_out: int, d_in: int) -> torch.Tensor:
-        w = torch.empty(petals, d_out, d_in)
         with torch.no_grad():
-            mean = math.log(math.sqrt(2.0 / d_in))
-            nn.init.normal_(w, mean=mean, std=0.2)
-        return w
+            mean = math.log(math.sqrt(2.0 / D_in))
+            nn.init.normal_(self.raw, mean=mean, std=0.2)
+
+    def compute_weight(self) -> torch.Tensor:
+        W = F.softplus(self.raw)
+        if self.norm_target is not None and self.training:
+            W_squared = W ** 2
+            norms = torch.sqrt((W_squared).sum(dim=(1, 2), keepdim=True) + 1e-12)  # (P,1,1)
+            W = W * (self.norm_target / norms)
+        return W.pow(2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (..., D)
-        orig = x.shape
-        x_flat = x.reshape(-1, self.in_dim)          # (N, D)
-        N = x_flat.size(0)
+        # x: (P, N, D_in)
+        W = self.compute_weight()                    # (P, D_out, D_in)
+        out = torch.bmm(x, W.transpose(1, 2))        # (P, N, D_out)
+        out = out + self.bias.unsqueeze(1)           # (P, N, D_out)
+        return out
 
-        # prepare weights & gates
-        w0 = F.softplus(self.weight_raw_0).pow(2)    # (P, 2D, D)
-        w1 = F.softplus(self.weight_raw_1).pow(2)    # (P, D, 2D)
-        g0 = torch.sigmoid(self.gate_raw_0).view(self.P, 1, 1)  # (P,1,1)
-        g1 = torch.sigmoid(self.gate_raw_1).view(self.P, 1, 1)
 
-        # ----- first layer across petals -----
-        x_in = x_flat.unsqueeze(0).expand(self.P, N, self.in_dim)       # (P, N, D)
-        x_w0 = torch.bmm(x_in, w0.transpose(1,2))                       # (P, N, 2D)
-        x_w0 = x_w0 + self.bias_0.unsqueeze(1)                          # (P, N, 2D)
-        z0   = self.act(x_w0 * g0)                                      # (P, N, 2D)
-
-        # ----- second layer -----
-        x_w1 = torch.bmm(z0, w1.transpose(1,2))                         # (P, N, D)
-        x_w1 = x_w1 + self.bias_1.unsqueeze(1)                          # (P, N, D)
-
-        # ----- residual path via bmm -----
-        # z_weight: (P, 2D, D), z0: (P, N, 2D) → z_mapped: (P, N, D)
-        z_mapped = torch.bmm(z0, self.z_weight)                         # (P, N, D)
-
-        # combine, activate, add final bias
-        z1 = self.act(x_w1 * g1 + z_mapped)                             # (P, N, D)
-        out = z1 + self.output_bias.unsqueeze(1)                        # (P, N, D)
-
-        # reshape back to original leading dims + (P, D)
-        out = out.permute(1, 0, 2)  # (N, P, D)
-        lead_dims = list(orig[:-1])                 # e.g. [B, H, T]
-        new_shape = lead_dims + [self.P, self.in_dim]  # [B, H, T, P, D]
-        return out.reshape(new_shape)
-
-#based on BatchedICNN but with additional inputs from X.
-
-class KCN(nn.Module):
-    def __init__(self, in_dim: int, petals: int, out_dim: int = None):
+class ACN(nn.Module):
+    def __init__(self, in_dim: int, petals: int, out_dim: int = None, norm_target: float = 10.0):
+        """
+        norm_target – desired Frobenius norm of each petal's W2 matrix.
+        """
         super().__init__()
         self.in_dim  = in_dim
         self.out_dim = out_dim if out_dim is not None else in_dim
         self.P = petals
-        self.k = 8
+        self.norm_target = norm_target
         D_in, D_out = self.in_dim, self.out_dim
 
-        # 1. Shared Positive Basis Projection φ(x) → D_out
-        self.phi_proj = PositiveLinearHK(D_in * self.k, D_out)
+        # Shared φ-projection
+        self.phi_proj = PositiveLinearHK(D_in, D_out)
 
-        # 2. Petal-wise second projection weights: Positive via HK
-        self.raw_weight2 = nn.Parameter(torch.empty(petals, D_out, D_out))
-        with torch.no_grad():
-            mean = math.log(math.sqrt(2.0 / D_out))
-            nn.init.normal_(self.raw_weight2, mean=mean, std=0.2)
-        self.bias2 = nn.Parameter(torch.zeros(petals, D_out))
+        # Second positive layer
+        self.w2 = PositiveLinear3DHK(petals, D_out, D_out)
+
+        self.b2        = nn.Parameter(torch.zeros(petals, D_out))
         self.gate_raw2 = nn.Parameter(torch.full((petals,), -3.0))
 
-        # 3. Shared Softplus shifts
-        shifts = torch.linspace(-1.0, 1.0, self.k).view(1, 1, self.k)
-        self.register_buffer("shifts", shifts)
-
-        # 4. Residual connection (linear, may remain unconstrained)
+        # Residual
         self.z_weight = nn.Parameter(torch.empty(petals, 2 * D_in, D_out))
         nn.init.kaiming_uniform_(self.z_weight, a=math.sqrt(5))
 
-        # 5. Gate and bias per petal
+        # First-layer gate and output bias
         self.gate_raw = nn.Parameter(torch.full((petals,), -3.0))
-        self.output_bias = nn.Parameter(torch.zeros(petals, D_out))
+        self.out_bias = nn.Parameter(torch.zeros(petals, D_out))
 
         self.act = nn.Softplus()
 
+    # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig = x.shape
-        x_flat = x.reshape(-1, self.in_dim)
-        N = x_flat.size(0)
+        orig   = x.shape
+        x_flat = x.reshape(-1, self.in_dim)           # (N, D_in)
+        N      = x_flat.size(0)
 
-        xb = x_flat.unsqueeze(-1) + self.shifts
-        phi = F.softplus(xb)
-        phi_flat = phi.reshape(N, self.in_dim * self.k)
+        # φ(x)
+        phi = F.softplus(x_flat)                      # (N, D_in)
+        h   = self.phi_proj(phi)                      # (N, D_out)
 
-        x_proj_shared = self.phi_proj(phi_flat)
-        x_proj = x_proj_shared.unsqueeze(0).expand(self.P, N, self.out_dim)
-        g1 = torch.sigmoid(self.gate_raw).view(self.P, 1, 1)
-        z0 = self.act(x_proj * g1)
+        # expand & gate 1
+        h = h.unsqueeze(0).expand(self.P, N, self.out_dim)   # (P,N,D_out)
+        g1 = torch.sigmoid(self.gate_raw).view(self.P,1,1)
+        z0 = self.act(h * g1)
 
-        # Apply softplus^2 to ensure positivity of second weights
-        w2 = F.softplus(self.raw_weight2).pow(2).transpose(1, 2)
-        z1 = torch.bmm(z0, w2) + self.bias2.unsqueeze(1)
-        g2 = torch.sigmoid(self.gate_raw2).view(self.P, 1, 1)
+        # W2 (positive,Frobenius normed) + gate 2
+        z1 = self.w2(z0) 
+        g2 = torch.sigmoid(self.gate_raw2).view(self.P,1,1)
         z1 = self.act(z1 * g2)
 
-        x_res_in = torch.cat([x_flat, x_flat], dim=-1)
-        x_res_exp = x_res_in.unsqueeze(0).expand(self.P, N, 2 * self.in_dim)
-        x_res = torch.bmm(x_res_exp, self.z_weight)
+        # residual
+        res = torch.cat([x_flat, x_flat], dim=-1).unsqueeze(0)
+        res = torch.bmm(res.expand(self.P, N, 2*self.in_dim), self.z_weight)
 
-        z_final = self.act(z1 + x_res) + self.output_bias.unsqueeze(1)
-        out = z_final.permute(1, 0, 2)
-        new_shape = list(orig[:-1]) + [self.P, self.out_dim]
-        return out.reshape(new_shape)   
+        # combine + bias
+        out = self.act(z1 + res) + self.out_bias.unsqueeze(1)   # (P,N,D_out)
+        out = out.permute(1, 0, 2)  # (N, P, D)
+        lead_dims = list(orig[:-1])                 # e.g. [B, H, T]
+        new_shape = lead_dims + [self.P, self.in_dim]  # [B, H, T, P, D]
+        return out.reshape(new_shape)        
+
 
 class _FusedLogSumExp(torch.autograd.Function):
     @staticmethod
@@ -414,7 +376,7 @@ class ScalarHull(nn.Module):
         self.in_dim = in_dim
         self.register_buffer('nu',  torch.tensor(1.64872127070012814684865078781416357165))
         self.register_buffer('noise_scale', torch.tensor(1e-5))
-        self.petals = BatchedICNN(self.in_dim, petals)
+        self.petals = ACN(self.in_dim, petals)
         self.gate   = ConvexGate(in_dim)
         self.register_buffer("creative", torch.tensor(True))
         self.register_buffer('eps', torch.tensor(1e-6))
@@ -461,7 +423,7 @@ class VectorHull(nn.Module):
         self.in_dim = dim
         self.out_dim = out_dim if out_dim is not None else dim
         self.register_buffer('noise_scale', torch.tensor(1e-5))
-        self.petals = BatchedICNN(self.in_dim, petals)
+        self.petals = ACN(self.in_dim, petals)
         self.gate   = ConvexGate(dim)
         self.register_buffer("creative", torch.tensor(True))
         self.register_buffer('eps', torch.tensor(1e-6))
