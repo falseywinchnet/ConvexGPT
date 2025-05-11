@@ -621,7 +621,29 @@ class ConstValueBank(nn.Module):
 # This keeps f(x)=A(x)@V convex, hull-preserving, and scales with (d_k, S)
 # as per the table above.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class _FusedLogSumExp4D(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor):
+        m, _ = x.max(dim=-1, keepdim=True)           # shape: (B,H,S,1)
+        y = x - m
+        ex = y.exp()
+        s = ex.sum(dim=-1, keepdim=True)
+        lse = m + s.log()
+        ctx.save_for_backward(ex, s)
+        return lse
 
+    @staticmethod
+    def backward(ctx, grad_output):
+        ex, s = ctx.saved_tensors
+        grad_x = grad_output * (ex / s)
+        return grad_x
+
+class FusedLogSumExp4D(nn.Module):
+
+    @torch.jit.ignore
+    def forward(self, x: torch.Tensor):
+        return _FusedLogSumExp4D.apply(x)
+        
 class ConvexMixer(nn.Module):
     def __init__(self,heads:int, d_k: int, r: int):
         super().__init__()
@@ -635,9 +657,10 @@ class ConvexMixer(nn.Module):
         self.lin_h_k = nn.Linear(d_k, r, bias=False)
         self.register_buffer('creative', torch.tensor(True))
         self.fused = FusedLogSumExp(dim=-1)
-        self.bank = ConstValueBank(heads, d_k,flat_dict=False)
+        self.bank = ConstValueBank(heads, d_k,flat_dict=True)
+        self.fused4d = FusedLogSumExp4D()
 
-    def forward(self, q, k, v, mask,mask_back):
+    def forward(self, q, k, v, mask):
         B, H, S, D = q.shape
         device = q.device
 
@@ -669,6 +692,9 @@ class ConvexMixer(nn.Module):
         # ——— 3) random-feature kernel ———
         phi_q = self.gate(self.lin_h_q(q).clamp(max=20.0))
         phi_k = self.gate(self.lin_h_k(k).clamp(max=20.0))
+        phi_q = phi_q / (phi_q.sum(dim=-1, keepdim=True) + self.eps)
+        phi_k = phi_k / (phi_k.sum(dim=-1, keepdim=True) + self.eps)
+        #convexity preserving normalization
         log_phi_q = torch.log(phi_q + self.eps)
         log_phi_k = torch.log(phi_k + self.eps)
         logK = self.fused((phi_q+self.eps).log().unsqueeze(-2)
@@ -682,7 +708,7 @@ class ConvexMixer(nn.Module):
         scores = fq.unsqueeze(-1) + gk.unsqueeze(-2) + logK + log_mask  # additive
         
         logits = scores * tau.squeeze(-1).unsqueeze(-1)
-        log_weights = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+        log_weights = logits - self.fused4d(logits)
         weights = torch.exp(log_weights)  # (B,H,S,S)
         # in forward(), after log_weights → weights
         # weights: (B, H, S, S)  →  row-simplex A
@@ -832,7 +858,7 @@ class PairwiseHullAttention(nn.Module):
         self.register_buffer("creative", torch.tensor(True))
         self.rope = ConvexRoPE(self.d_k)
 
-    def forward(self, x, mask=None,mask_back=None):
+    def forward(self, x, mask):
         self.phase(x,mask) #apply in-place positional phasing
         B, S, E = x.shape
         Q, K, V= self.pre(x)
@@ -843,7 +869,7 @@ class PairwiseHullAttention(nn.Module):
         std  = 0.5 * (Q.std()  + K.std())
         Q = (Q - mean) / std
         K = (K - mean) / std        
-        y,attn_scores = self.mixer(Q, K, V, mask=mask,mask_back=mask_back)
+        y,attn_scores = self.mixer(Q, K, V, mask=mask)
         
         y = y.transpose(1, 2).reshape(B, S, self.embed_dim)
         return self.W_O(y), attn_scores
@@ -870,8 +896,8 @@ class FrozenAffine(nn.Module):
     def forward(self, x):
         if self.training and self.steps < self.freeze_after:
             with torch.no_grad():
-                m = x.mean(dim=0)
-                v = x.var(dim=0, unbiased=False).sqrt()
+                m = x.mean(dim=(0, 1))  # mean over both batch and sequence
+                v = x.var(dim=(0, 1), unbiased=False).sqrt()
                 self.mu    = (1-self.mom) * self.mu    + self.mom * m
                 self.sigma = (1-self.mom) * self.sigma + self.mom * v
                 self.steps += 1
@@ -879,14 +905,6 @@ class FrozenAffine(nn.Module):
         γ = torch.sigmoid(self.rho)           # (0,1)
         x_hat = (x - self.mu) / (self.sigma + self.eps)
         return x_hat * γ + self.beta
-        
-class ConstantGate(nn.Module):
-    def __init__(self, theta: float = 1/math.e):
-        super().__init__()
-        self.theta = theta
-    def forward(self, x):
-        # ignore x, always return fixed scalar ∈ (0,1)
-        return self.theta
 
 class OmniHullBlock(nn.Module):
     def __init__(self, dim, heads, moe_petals):
@@ -899,10 +917,10 @@ class OmniHullBlock(nn.Module):
         self.res_gate1 = ConvexGate(dim)
         self.res_gate2 = ConvexGate(dim)
 
-    def forward(self, x, mask=None, mask_back=None):
+    def forward(self, x, mask):
         # ——— attention branch ———
         x0, _ = x, None
-        x1, attn_scores = self.attn(self.ln1(x0), mask, mask_back)   # x1 is the residual delta
+        x1, attn_scores = self.attn(self.ln1(x0), mask)   # x1 is the residual delta
         g1 = self.res_gate1(x0)                                      # shape (B,S,1)
         x  = x0 + g1 * x1
 
@@ -954,14 +972,9 @@ class ConvexEmbedding(nn.Module):
         raw = self.out(h1)                    # → (batch, seq, out_dim)
         return self.contraction(raw)          # attenuate each cha
 
-def tokens_to_simplex(idx: torch.LongTensor, vocab_size: int) -> torch.FloatTensor:
-    """
-    Convert token indices to one-hot simplex representation (batch, seq, V).
-    At inference, P is exactly one-hot; for relaxed optimization, replace with softmax.
-    """
+def tokens_to_simplex(idx, vocab_size: int) -> torch.Tensor:
     P = F.one_hot(idx, num_classes=vocab_size).float()
     return P
-
         
 # ----------------------------------------------------------------------
 #   GPT Wrapper with Causal Mask
@@ -991,8 +1004,7 @@ class ConvexGPT(nn.Module):
         OmniHullBlock(
             self.embed_dim,
             heads,
-            moe_petals
-                  )
+            moe_petals)
             for i in range(depth)
         ])
 
@@ -1061,13 +1073,12 @@ class ConvexGPT(nn.Module):
         x = torch.stack([embeddings, torch.zeros_like(embeddings)], dim=-1).reshape(idx.shape[0], idx.shape[1], self.embed_dim)
 
         # 3) build causal mask
-        mask_back = self.reversed_logistic_mask(S)          # (1, 1, S, S)
-        mask = self.logistic_mask(S)          # (1, 1, S, S)
+        mask = self.reversed_logistic_mask(S)          # (1, 1, S, S)
 
         attn_scores = []
         # 4) apply each block (which will write φ into odd slots)
         for blk in self.blocks:
-            x,attn_temp = blk(x, mask,mask_back)
+            x,attn_temp = blk(x, mask)
             attn_scores.append(attn_temp)
 
         attn_scores =  torch.stack(attn_scores).mean(dim=0)#divide by heads
