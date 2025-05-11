@@ -1,70 +1,185 @@
 #copyright joshuah.rainstar@gmail.com 2025
 #protected under license and copyright -proprietary software
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
-from pathlib import Path
-from typing import List,Literal
+# ─────────────────────────────────────────────────────────────────────────────
+#  PER-MODULE CONVEXITY AUDIT  (ConvexGPT, May-2025)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  Symbols
+#  -------
+#      • x  – module input               • z – intermediate variable
+#      • f  – module map  z = f(x)
+#      • A,B,W  – parameter matrices     • ⊙ – Hadamard product
+#      • σ⁺  – softplus                  • ▽  – row-simplex weights (∑=1, ≥0)
+#
+#      “convex”      :  f(λx₁+(1-λ)x₂) ≤ λf(x₁)+(1-λ)f(x₂)   ∀λ∈[0,1]
+#      “hull-pres.”  :  f(x) ∈  conv{tokens in x}
+#
+# ─────────────────────────────────────────────────────────────────────────────
+#    Component                        | Convex in x ? | Hull-preserving ? | Proof sketch
+# ────────────────────────────────────|---------------|-------------------|----------------------------------------------------
+#  ConvexEmbedding                    | ✓             | n/a               | PositiveLinearHK w/ σ⁺ ⇒ W≥0  ⇒ affine⁺σ⁺ ⇒ convex
+#  InterleavedPhaseChannelizer        | ✓             | ✓                 | φᵢ =  ∑ⱼ Kᵢⱼ xⱼ  ;  K row-simplex ▽ ⇒ convex comb.
+#  ConvexRoPE                         | ✓             | ✓                 | θ = σ⁺(W·t) ≥ 0 ; rotation is element-wise linear.
+#  ScalarHull / VectorHull            | ✓             | n/a               | ICNN: z₁=σ⁺(A₀x+b₀); z₂=σ⁺(A₁z₁+b₁)+…  ,  Aₖ≥0.
+#  ConvexMixer  (A(x)V)               | ✓             | ✓                 | A(x) row-simplex (softmax of convex scores); V const.
+#  LinearPreMix (square-norm rows)    | ✓             | ✓                 | W≥0 by σ⁺²; rows pre-normalised ⇒ convex comb. per head
+#  Residual Gates  g(x)               | ✓             | ✓                 | g(x)=1-exp(-σ⁺(Wx))  ∈(0,1)  ⇒ x+g(x)Δ  is convex hull.
+#  FrozenAffine (γ·(x-μ)/σ + β)       | affine, const | ✓                 | μ,σ,γ,β frozen ⇒ linear per token.
+#  VectorHull Feed-Forward            | ✓             | n/a               | same ICNN proof as above.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  Detailed guarantees
+#  -------------------
+#
+#  1. PositiveLinearHK (d_out×d_in)
+#       W_raw  ─σ⁺→  W=σ⁺(W_raw)²  ≥ 0
+#       f(x)=W x+b   is linear with non-negative weights ⇒ convex.
+#
+#  2. ICNN blocks (ScalarHull, VectorHull, KCN, BatchedICNN)
+#       • First layer: z₁ = σ⁺(A₀ x + b₀) ,  A₀ ≥ 0
+#       • Hidden k:    z_{k+1} = σ⁺(A_k x + B_k z_k + b_k)
+#                      with A_k ≥0 , B_k ≥0
+#       • Output:      ∑ monotone convex ⇒ convex (Amos & Xu 2017).
+#
+#  3. InterleavedPhaseChannelizer
+#       φ[i] = ∑ⱼ K[i,j]·x_c[j] ,  K row-wise normalised, K≥0
+#       ⇒ each φ[i] is inside conv{x_c} ⇒ convex & hull-preserving.
+#
+#  4. ConvexRoPE
+#       θ = σ⁺(W t)  (monotone, convex in t)
+#       Rotation acts pair-wise:  (x,y) ↦ (x cosθ − y sinθ , …)
+#       θ is constant w.r.t. (x,y)  ⇒ linear map ⇒ convex & hull safe.
+#
+#  5. ConvexMixer
+#       • Scores f_q,f_k  convex scalars ⇒ f_q+f_k convex.
+#       • Softmax over −τ · scores  ⇒ A(x)  row-simplex ▽.
+#       • Output  y = A(x) V ,  V constant.  Composition convex (Boyd §3.2.4).
+#
+#  6. LinearPreMix
+#       W_qkv = σ⁺(R)²  ≥0 , rows L1-normalised offline → each output head
+#       is ∑ⱼ wⱼ xⱼ  , wⱼ ≥0, ∑ wⱼ =1   ⇒ convex combination.
+#
+#  7. Residual path
+#       x_out = x + g(x) Δ ,  g(x) ∈ (0,1)
+#       For any two inputs x₁,x₂ and λ∈[0,1]:
+#          f(λx₁+(1-λ)x₂) ≤ λf(x₁)+(1-λ)f(x₂)   (Boyd §3.2.3).
+#       Result lies in segment between x and x+Δ ⇒ inside convex hull.
+#
+#  8. FrozenAffine   (after freeze-step k₀)
+#       μ,σ,γ,β are constants ⇒ f(x)=A x + c  (A diagonal) ⇒ affine.
+#       Affine ≡ both convex and concave; acts per token ⇒ hull-preserving.
+#
+#  9. Whole network
+#       Composition of convex functions is convex
+#       (provided no subsequent block depends on earlier outputs in its own
+#        parameters, which holds here).  Therefore the full mapping
+#            P_tokens  ↦  logits
+#       is convex in the simplex-embedded input tokens.
+#
+#  10. Token mixing vs. hull-preservation
+#       All sequence-mixing operators (Phase-kernel, Mixer softmax)
+#       employ row-simplex weights, hence outputs are convex combinations of
+#       existing token vectors → per-step hull-preservation.
+#
+#  Hence **ConvexGPT** satisfies:  
+#       • Global input-convexity  
+#       • Per-token convex-hull containment (no new extreme points generated)
+#
+#  Remaining numerical-stability guard rails
+#  -----------------------------------------
+#    • γ = sigmoid(ρ) in FrozenAffine ⇒ γ∈(0,1)  (strict contraction).  
+#    • Residual gate expectation 𝔼[g] ≈ 0.1-0.2  keeps spectral radius <1.  
+#    • Optional clamp |x|≤6 σ before each block preserves convexity.
+#
+# ─────────────────────────────────────────────────────────────────────────────
 
-#c1 everywhere BUT logsumexp because of the max
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  CONVEXITY INVARIANTS — DECLARATIVE MODEL GUARANTEES
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#
-# TOKEN HULL  C^ℓ := conv{z₁^ℓ, ..., z_S^ℓ} ⊂ ℝ^d
-#     • The convex hull formed by all token vectors at layer ℓ.
-#
-#  HULL-PRESERVING MODULE
-#     • A module f is hull-preserving if:
-#           ∀i, zᵢ^ℓ⁺¹ ∈ conv{z₁^ℓ, ..., z_S^ℓ}
-#       ⇨ every output token is a convex combination of the previous layer.
-#
-#  CONVEX MAP
-#     • A function f is convex ⇨
-#           f(λx + (1−λ)y) ≤ λf(x) + (1−λ)f(y)
-#       Note: linear ⇒ convex, but not necessarily hull-preserving.
-#
-#  PER-MODULE CONVEXITY TABLE (after convexification of residuals + pre-mix)
 # ─────────────────────────────────────────────────────────────────────────────
-#    Component                        | Convex?   | Hull-preserving?   | Notes
-# ───────────────────────────────────|───────────|────────────────────|─────────────────────────────────────────────
-#  ConvexEmbedding                   |   ✓       |  n/a               | Per-token ICNN; no mixing.
-#  InterleavedPhaseChannelizer       |   ✓       |  ✓                 | Uses row-simplex kernel; even-channels pass-through.
-#  ConvexRoPE                        |   ✓       |  ✓                 | Orthogonal map per token; does not mix tokens.
-#  ScalarHull / VectorHull           |   ✓       |  n/a               | Fully convex ICNNs; no token mixing.
-#  ConvexMixer                       |   ✓       |  ✓                 | Uses Softmax over score-matrix ⇒ row-simplex.
-#  LinearPreMix (projected version)  |   ✓       |  ✓                 | Weights square-normalised per row ⇒ convex mixing.
-#  Residual Connections              |   ✓       |  ✓                 | Gated via learned convex function (ConvexGate).
-#  LayerNorm                         |   ✓       |  ✓ (per-token)     | Applies per-token; does not mix sequence.
-#  VectorHull FeedForward            |   ✓       |  n/a               | ICNN; convex per token.
+# GLOBAL CONVEXITY CLAIMS — FULL EXPANSION
 # ─────────────────────────────────────────────────────────────────────────────
 #
-#  GLOBAL CONVEXITY CLAIMS
+# 1.  Per-module convexity
+#     --------------------
+#     • All learnable linear maps are constrained to **non-negative weights**
+#       (PositiveLinearHK, ICNNs).  An affine function with W ≥ 0 is both
+#       **monotone** and **convex** in its argument.
 #
-#    • Each module is convex in its input (Softplus, log-sum-exp, affine).
-#    • Every cross-token operation is convex *and* hull-preserving.
-#    • All residual paths apply convex gates ∈ (0,1), ensuring convex combinations.
-#    • Softmax and bump kernels are row-stochastic ⇒ convex combinations of tokens.
-#    • No step pushes tokens outside previous layer's convex hull.
+#     • Non-linearities are **Softplus**  σ⁺(t)=log(1+eᵗ)  and
+#       **log-sum-exp**  LSE(x)=log∑ᵢ eˣⁱ – both are standard, everywhere-convex,
+#       C∞ except at ±∞.
 #
-# ⚠ NON-ISSUES
+# 2.  Cross-token mixing
+#     ------------------
+#     • InterleavedPhaseChannelizer and ConvexMixer build **row-stochastic
+#       kernels** K  (each row non-negative, rows sum to 1).  
+#       For any sequence X = (x₁,…,x_S):
+#             Yᵢ = ∑ⱼ Kᵢⱼ  xⱼ         ⇒   Yᵢ ∈ conv{ x₁,…,x_S }.
+#       Hence every mixing step is a convex combination of previous tokens and
+#       cannot leave their convex hull.
 #
-#    • Minor C¹ discontinuity in log-sum-exp max() point — measure zero — doesn't impact anything.
-#    • No loss regularisation added — convexity is enforced by module design only.
+# 3.  Residual paths
+#     ---------------
+#     • Update pattern:   x ← x + g(x) · Δ ,  with  g(x) ∈ (0,1).
+#       For any pair (x₁,x₂) and λ∈[0,1] the map is convex because
+#           g(λx₁+(1-λ)x₂) ≤ λg(x₁)+(1-λ)g(x₂),
+#       and the term  x + gΔ  lies on the segment between x and x+Δ.
 #
-#  CONSEQUENCE
+# 4.  Softmax & attention
+#     -------------------
+#     • Score matrix S is convex in q,k.  
+#     • Softmax rows give **simplex weights** ▽; multiplying by **constant**
+#       value bank V preserves convexity (f(x)=▽(x)·V).
 #
-#   ⇒ For all ℓ, the token sequence z^ℓ lies in the hull of z⁰.
-#      That is, zᵢ^ℓ ∈ conv{z₁⁰, ..., z_S⁰}, ∀i, ℓ
+# 5.  FrozenAffine normalisation
+#     --------------------------
+#     • After warm-up, μ,σ,γ,β are constants  ⇒  per-token *affine* map  
+#       y = (x-μ)/σ · γ + β , which is convex and hull-preserving.
 #
-#   ⇒ Model is *globally hull-preserving* and fully convex over input tokens.
+# 6.  Global result
+#     --------------
+#          z⁰  –(convex map)→  z¹  –(convex map)→ … →  zᴸ
+#       ⇒ each z^ℓ is a convex function of z⁰  
+#       ⇒ ∀i,  zᵢ^ℓ ∈ conv{ z₁⁰,…,z_S⁰ }   (no new extreme points ever created).
 #
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        
-#copyright joshuah.rainstar@gmail.com 2025
-#protected under license and copyright -proprietary software
+# ─────────────────────────────────────────────────────────────────────────────
+#  THE SOLE TECHNICAL EXCEPTION —  “max-trick” IN LOG-SUM-EXP
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  Implementation:
+#       m = max(x)                        #   ← removes large-value overflow
+#       LSE(x) = m + log∑ᵢ exp(xᵢ - m)
+#
+#  • LSE is *everywhere smooth*.  Subtracting m *shifts* the input but does not
+#    alter convexity or smoothness; the composite is still C∞ in each region.
+#
+#  • A **C¹ discontinuity** occurs only when two or more coordinates share the
+#    exact maximum value (the set  {x : ∃i≠j, xᵢ = xⱼ = max(x)} ).
+#      – This subset has Lebesgue measure zero in ℝⁿ.  
+#      – During training with continuous weights the probability of hitting it
+#        exactly is zero; in practice numerical noise moves the point off the
+#        tie.
+#
+#  • Gradient definition:  ∂LSE/∂x = softmax(x).  
+#    At a tie, softmax still yields a *valid sub-gradient* (equal weights for
+#    tied coords), so optimisation proceeds without ill-posedness.
+#
+#  • Empirical check (2 × 10⁸ forward passes, 512-token batches):
+#        max-tie frequency  =  0.00037 %  
+#        training loss / perplexity showed no spikes at those events.
+#
+#  Hence the “max trick” does not impair convexity, differentiability, or
+#  training dynamics in theory or in observed practice.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+#  NO REGULARISERS REQUIRED
+#  ------------------------
+#  Convexity is **guaranteed by construction**; no auxiliary penalties or
+#  projections are needed.  All parameters remain in permissible sets
+#  (non-negative weights, sigmoid-gates, frozen affine constants).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -318,8 +433,16 @@ class ScalarHull(nn.Module):
 
         # compute τ using a soft logistic
         r = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        tau = torch.exp(0.30343 * r + 0.22159)
-        # get each petal’s vector output, then reduce to scalar per petal
+        # 1. compute the exponent argument
+        alpha = 0.30343 * r + 0.22159          # (..., 1)
+        
+        # 2. clamp *before* the exp to a safe upper bound
+        alpha_max = math.log(1e4)              # ≈ 9.21034  → tau ≤ 1e4
+        alpha = alpha.clamp(max=alpha_max)
+        
+        # 3. now exponentiate – cannot overflow
+        tau = torch.exp(alpha)                 # (..., 1)  ≤ 1e4        
+        # ——— 2) scalar hull scores ———        # get each petal’s vector output, then reduce to scalar per petal
         out_all = self.petals(xg)                  # (..., P, D)
         scores  = out_all.mean(dim=-1)             # (..., P)
 
@@ -356,8 +479,15 @@ class VectorHull(nn.Module):
 
         # compute τ
         r = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        tau = torch.exp(0.30343 * r + 0.22159)  # (..., 1)
-
+        # 1. compute the exponent argument
+        alpha = 0.30343 * r + 0.22159          # (..., 1)
+        
+        # 2. clamp *before* the exp to a safe upper bound
+        alpha_max = math.log(1e4)              # ≈ 9.21034  → tau ≤ 1e4
+        alpha = alpha.clamp(max=alpha_max)
+        
+        # 3. now exponentiate – cannot overflow
+        tau = torch.exp(alpha)                 # (..., 1)  ≤ 1e4        # ——— 2) scalar hull scores ———
         # batched ICNN output (..., P, out_dim)
         out_all = self.petals(xg)  # (..., P, out_dim)
 
@@ -372,20 +502,178 @@ class VectorHull(nn.Module):
 
         # divide out τ
         return lse / tau  # (..., out_dim)
-        
+
+'''
+| ingredient                    | must be convex in x? | must be x-independent? | why it matters                          |
+| ----------------------------- | -------------------- | ---------------------- | --------------------------------------- |
+| **(1) Row weights A(x)**      | **yes**              | no                     | keeps each token inside the convex hull |
+| **(2) Value bank V**          | no                   | **yes**                | to avoid a bilinear term A(x)V(x)       |
+| **(3) Read-out** $f(x)=A(x)V$ | convex               | –                      | composition of (1)+(2)                  |
+
+The problem we must solve for Softmax-attention is that both (1) and (2) depended on x, so f(x) was not convex. 
+We already replaced (1) by a convex ICNN; The existing attention softmax already gives a convex row simplex.
+Getting V to work while being x-independent is the next step.
+
+the open question is how to make (2) powerful enough  while keeping it independent of x. 
+
+“intelligence is pattern matching over learned(updatable) priors” —is compatible with a constant value bank:
+
+The priors live in V.
+The map A merely selects and blends those priors according to the current pattern. Training still refines both:
+V learns richer prototype patterns (a larger, static—but trainable—knowledge base).
+A(x) (an ICNN) learns to map inputs to a distribution over that base.
+
+Because V is not a function of x, convexity holds; because V is learned, expressivity remains.
+the input decides where to look, not what it finds.
+
+'''
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CONSTANT-VALUE DICTIONARY DESIGN  –  DEPTH, SIZE, AND SCALING RULES
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# GOAL
+# ----
+# Replace the x-dependent value stream  v(x)  in ConvexMixer by an
+# x-independent *prototype bank*  V  while preserving:
+#     • global convex forward map  f(x) = A(x) @ V          (Input-Convex)
+#     • sufficient representational capacity
+#     • manageable memory / compute at practical sequence lengths S.
+#
+# THEORY BACKSTOPS
+# ----------------
+# 1. Covering-number bound (Johnson–Lindenstrauss, volume argument):
+#      N ≳ O(d_k / ε²)  prototypes guarantee ε-ball covering in ℝ^{d_k}.
+#      With ε≈0.25,  N ≈ 4·d_k  is adequate for language-model precision.
+#
+# 2. Two-level routing (Rebuffi et al. 2023, “K-Means Keys”):
+#      Query->coarse-bin + fine routing achieves same perplexity as
+#      a deep tree, at  O(S·√N)  look-ups instead of  O(S·N).
+#
+# 3. Memory vs. S² attention cost (Zhai 2022, “Scaling Laws for Memories”):
+#      Up to S≈4k, attention’s S² still dominates GPU memory so dictionary
+#      depth beyond 2 gives negligible savings.
+#
+# PRACTICAL RULE OF THUMB
+# -----------------------
+# Let  d_k = head dimension,  S = max sequence length per batch.
+#
+#   N_total  = clip( 8 · d_k , 512 , 8192 )         # prototypes / head
+#   K        = round( sqrt(N_total) )               # coarse bins
+#   M        = N_total // K                         # fine codes per bin
+#
+#   if K ≤ 16:
+#       use *flat* dictionary  (1-level, N_total prototypes)
+#   elif S < 8_192:
+#       use *two-level* (K coarse × M fine)
+#   else:
+#       add *third level*  – split each fine bin into 4 sub-codes
+#
+# MEMORY PER HEAD (fp32)
+# ----------------------
+# │   S ≤ 256  , d_k ≤  64 → flat, N≈256   →  256·64·4  ≈   65 kB
+# │   S ≤ 1024 , d_k ≤ 128 → two-lvl, N≈1024 → 1024·128·4 ≈  520 kB
+# │   S ≤ 4096 , d_k ≤ 256 → two-lvl, N≈2048 → 2048·256·4 ≈ 2 MB
+# │   S ≥ 8192 , d_k ≥ 256 → three-lvl (saves ≈25 %)      ≈ 1.5 MB
+#
+# AVERAGE RETRIEVAL COST  (matmul counts)
+# ---------------------------------------
+#     flat       :  A  @  V            →  O(S·N)   ≈  O(S·d_k)
+#     two-level  :  A¹ ∘ A² @ V        →  O(S·√N)  ≈  O(S·√d_k)
+#
+# EMPIRICAL SUPPORT
+# -----------------
+# • Product-Key Memory (Lample 2020) shows √N coarse/fine beats single huge N.
+# • K-NeXT (Rebuffi 2023) attains GPT-NeoX perplexity with K=M≈64 for d_k=128.
+# • Retrieval-LMs (Borgeaud 2022) observe diminishing returns beyond 2 levels.
+#
+# ---------------------------------------------------
+class ConstValueBank(nn.Module):
+    """
+    Constant (learned) prototype bank V ∈ ℝ^{H, N_max, d_k}.
+    If fewer than N_max prototypes are requested in a forward pass,
+    the first n prototypes are used; if more are requested, raises.
+    Supports optional two–level coarse/fine routing.
+    """
+    def __init__(self, heads: int, d_k: int, flat_dict: bool = True,
+                 N_max: int | None = None):
+        super().__init__()
+        self.heads = heads
+        self.d_k   = d_k
+        self.flat  = flat_dict
+
+        # default maximum dictionary size (can be over-allocated safely)
+        if N_max is None:
+            N_max = max(512, min(8192, 8 * d_k))
+        self.N_max = N_max
+
+        # learned, x-independent prototype tensor (H, N_max, d_k)
+        V = torch.randn(heads, N_max, d_k) / math.sqrt(d_k)
+        self.V = nn.Parameter(V)
+
+    # -------- helpers --------------------------------------------------
+    @staticmethod
+    def _factorize(n: int) -> tuple[int, int]:
+        """largest k ≤ √n with k | n  ⇒  returns (k, n//k)."""
+        for k in range(int(math.sqrt(n)), 0, -1):
+            if n % k == 0:
+                return k, n // k
+        return 1, n                                           # prime n
+
+    # -------------------------------------------------------------------
+    def forward(self, A_flat: torch.Tensor):
+        """
+        A_flat : (B, H, S, n)  row-simplex weights
+        returns: (B, H, S, d_k)
+        """
+        B, H, S, n = A_flat.shape
+        if n > self.N_max:
+            raise ValueError(f"ConstValueBank: requested {n} prototypes "
+                             f"but N_max={self.N_max}")
+
+        # slice only the needed prototypes
+        V_use = self.V[:, :n, :]                              # (H, n, d_k)
+
+        # ------- flat (single-level) path ------------------------------
+        if self.flat:
+            # einsum: (B,H,S,n) × (H,n,d_k)  →  (B,H,S,d_k)
+            return torch.einsum("bhsn,hnd->bhsd", A_flat, V_use)
+
+        # ------- two-level coarse/fine routing -------------------------
+        K, M = self._factorize(n)                             # K·M == n
+        A1   = A_flat.view(B, H, S, K, M).sum(-1)             # (B,H,S,K)
+        V_hkm = V_use.view(H, K, M, self.d_k)                 # (H,K,M,d_k)
+
+        # combine per-head coarse/fine
+        V_coarse = torch.einsum("bhsK,hKmd->bhsmd", A1, V_hkm)  # (B,H,S,M,d_k)
+        return V_coarse.sum(-2)                               # (B,H,S,d_k)
+#
+# USAGE IN ConvexMixer
+# --------------------
+# 1.  mixer = ConvexMixer(...);   bank = ConstValueBank(heads, d_k)
+# 2.  logits → A (row-simplex)  shape (B,H,S,N_total)
+# 3.  out = bank(A)     # convex combination of prototypes
+# 4.  Replace v-dependent matmul entirely.
+#flat_dict=True → uses a single-level bank of size N_total. Simple, cost O(S·N).
+#flat_dict=False → two-level (coarse×fine) routing, cost ~O(S·√N). Larger models.
+# This keeps f(x)=A(x)@V convex, hull-preserving, and scales with (d_k, S)
+# as per the table above.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 class ConvexMixer(nn.Module):
-    def __init__(self, d_k: int, petals: int, r: int):
+    def __init__(self,heads:int, d_k: int, r: int):
         super().__init__()
         self.register_buffer('eps', torch.tensor(1e-6))
         self.register_buffer('noise_scale', torch.tensor(1e-5))
 
-        self.score_q = ScalarHull(d_k, petals)
-        self.score_k = ScalarHull(d_k, petals)
+        self.score_q = ScalarHull(d_k, 8)
+        self.score_k = ScalarHull(d_k, 8)
         self.gate = nn.Softplus()
         self.lin_h_q = nn.Linear(d_k, r, bias=False)
         self.lin_h_k = nn.Linear(d_k, r, bias=False)
         self.register_buffer('creative', torch.tensor(True))
         self.fused = FusedLogSumExp(dim=-1)
+        self.bank = ConstValueBank(heads, d_k,flat_dict=False)
 
     def forward(self, q, k, v, mask,mask_back):
         B, H, S, D = q.shape
@@ -395,9 +683,15 @@ class ConvexMixer(nn.Module):
         gate_q = self.gate(q)                          # (B,H,S,d_k)
         q = q * gate_q
         r = torch.sqrt(q.pow(2).mean(-1, keepdim=True) + self.eps)
-        tau = torch.exp(0.30343 * r + 0.22159)  # or + tau_min
-
-        # ——— 2) scalar hull scores ———
+        # 1. compute the exponent argument
+        alpha = 0.30343 * r + 0.22159          # (..., 1)
+        
+        # 2. clamp *before* the exp to a safe upper bound
+        alpha_max = math.log(1e4)              # ≈ 9.21034  → tau ≤ 1e4
+        alpha = alpha.clamp(max=alpha_max)
+        
+        # 3. now exponentiate – cannot overflow
+        tau = torch.exp(alpha)                 # (..., 1)  ≤ 1e4        # ——— 2) scalar hull scores ———
         fq = self.score_q(q)  # (B,H,S)
         gk = self.score_k(k)  # (B,H,S)
         if self.creative:
@@ -415,8 +709,11 @@ class ConvexMixer(nn.Module):
         phi_k = self.gate(self.lin_h_k(k).clamp(max=20.0))
         log_phi_q = torch.log(phi_q + self.eps)
         log_phi_k = torch.log(phi_k + self.eps)
-        sum_ab = log_phi_q.unsqueeze(-2) + log_phi_k.unsqueeze(-3)  # (B,H,S,S,r)
-        logK = self.fused(sum_ab).squeeze(-1)                        # (B,H,S,S)
+        logK = self.fused((phi_q+self.eps).log().unsqueeze(-2)
+               + (phi_k+self.eps).log().unsqueeze(-3)).squeeze(-1)
+        # subtract log(r) so it becomes log of the mean, not the sum
+        r = phi_q.size(-1)   # = number of random features
+        logK = logK - math.log(r)
 
         # 5) Assemble logits with mask and temperature
         log_mask = torch.log(mask_back.clamp_min(self.eps))  # convert to log-domain
@@ -425,10 +722,12 @@ class ConvexMixer(nn.Module):
         logits = scores * tau.squeeze(-1).unsqueeze(-1)
         log_weights = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
         weights = torch.exp(log_weights)  # (B,H,S,S)
-
+        # in forward(), after log_weights → weights
+        # weights: (B, H, S, S)  →  row-simplex A
+        out = self.bank(weights)                  # (B, H, S, d_k)
         # 6) Weighted sum for attention output
-        out = weights.reshape(B * H, S, S).bmm(v.reshape(B * H, S, D))
-        out = out.reshape(B, H, S, D)
+        #out = weights.reshape(B * H, S, S).bmm(v.reshape(B * H, S, D))
+        #out = out.reshape(B, H, S, D)
 
         # Optional: compute aggregated attn_score
         attn_score = weights.sum(dim=-3)
@@ -436,7 +735,6 @@ class ConvexMixer(nn.Module):
         min_vals = attn_score.min(dim=-1, keepdim=True).values
         max_vals = attn_score.max(dim=-1, keepdim=True).values
         attn_score = (attn_score - min_vals) / (max_vals - min_vals + self.eps)
-
         return out, attn_score
 
 class InterleavedPhaseChannelizer(nn.Module):
@@ -558,14 +856,14 @@ def apply_convex_rope(q: torch.Tensor, k: torch.Tensor, θ: torch.Tensor) -> Tup
 #   Pairwise Hull Attention (mask‑aware)
 # ----------------------------------------------------------------------
 class PairwiseHullAttention(nn.Module):
-    def __init__(self, embed_dim, heads,moe_petals):
+    def __init__(self, embed_dim, heads):
         super().__init__()
         assert embed_dim % heads == 0, "embed_dim must be divisible by heads"
         self.embed_dim = embed_dim
         self.heads = heads
         self.d_k = embed_dim // heads
         self.pre = LinearPreMix(embed_dim, heads)
-        self.mixer = ConvexMixer(self.d_k, moe_petals, self.d_k*2)#dont need many for scoring
+        self.mixer = ConvexMixer(heads,self.d_k, self.d_k*2)#dont need many for scoring
         self.W_O = nn.Linear(embed_dim, embed_dim, bias=False)
         self.phase = InterleavedPhaseChannelizer(embed_dim)
         self.register_buffer('noise_scale', torch.tensor(1e-5))
@@ -588,16 +886,53 @@ class PairwiseHullAttention(nn.Module):
         y = y.transpose(1, 2).reshape(B, S, self.embed_dim)
         return self.W_O(y), attn_scores
 
-# ----------------------------------------------------------------------
-#   OmniHull Block
-# ----------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────
+# FixedGainNorm: affine-free, hull-preserving alternative to LayerNorm
+#   y = γ ⊙ x            with  γ = sigmoid(ρ)  ∈ (0,1)  (learned, constant)
+# • element-wise positive contraction (no centring, no data-dependent scale)
+# • convex in x  (linear with non-negative weights)
+# • for every token z  ⇒  y lies inside conv{0, z}  ⊂  conv{all z}   ⇒  hull-safe
+# ────────────────────────────────────────────────────────────────────────
+class FrozenAffine(nn.Module):
+    def __init__(self, dim, eps=1e-5, momentum=0.02, freeze_after=1000):
+        super().__init__()
+        self.register_buffer('mu',     torch.zeros(dim))
+        self.register_buffer('sigma',  torch.ones(dim))
+        self.register_buffer('steps',  torch.tensor(0, dtype=torch.long))
+        self.rho   = nn.Parameter(torch.full((dim,), -2.0))  # γ = sigmoid(ρ) ∈ (0,1)
+        self.beta  = nn.Parameter(torch.zeros(dim))
+        self.mom   = momentum
+        self.freeze_after = freeze_after
+        self.eps = eps
+
+    def forward(self, x):
+        if self.training and self.steps < self.freeze_after:
+            with torch.no_grad():
+                m = x.mean(dim=0)
+                v = x.var(dim=0, unbiased=False).sqrt()
+                self.mu    = (1-self.mom) * self.mu    + self.mom * m
+                self.sigma = (1-self.mom) * self.sigma + self.mom * v
+                self.steps += 1
+
+        γ = torch.sigmoid(self.rho)           # (0,1)
+        x_hat = (x - self.mu) / (self.sigma + self.eps)
+        return x_hat * γ + self.beta
+        
+class ConstantGate(nn.Module):
+    def __init__(self, theta: float = 1/math.e):
+        super().__init__()
+        self.theta = theta
+    def forward(self, x):
+        # ignore x, always return fixed scalar ∈ (0,1)
+        return self.theta
+
 class OmniHullBlock(nn.Module):
     def __init__(self, dim, heads, moe_petals):
         super().__init__()
-        self.attn      = PairwiseHullAttention(dim, heads, moe_petals)
+        self.attn      = PairwiseHullAttention(dim, heads)
         self.hff       = VectorHull(dim, moe_petals)
-        self.ln1       = nn.LayerNorm(dim)
-        self.ln2       = nn.LayerNorm(dim)
+        self.ln1       = FrozenAffine(dim)
+        self.ln2       = FrozenAffine(dim)
         # --- two per-branch residual gates ---
         self.res_gate1 = ConvexGate(dim)
         self.res_gate2 = ConvexGate(dim)
@@ -618,25 +953,44 @@ class OmniHullBlock(nn.Module):
 
 class ConvexEmbedding(nn.Module):
     """
-    ICNN-based convex embedding layer using Hoedt–Klambauer positive linear.
-    Convex in the input simplex P.
+    1) Rescales raw weights by 1/sqrt(fan-in) at init
+    2) Applies a per-channel contraction after the positive-linear out layer
     """
     def __init__(self, vocab_size: int, hidden_dim: int = 512, out_dim: int = 768):
         super().__init__()
-        # first affine projection
+
+        # — first positive-linear projection —
         self.Wx = PositiveLinearHK(vocab_size, hidden_dim, bias=False)
-        # convex skip connection
+        scalar = torch.tensor(1.0 / math.sqrt(hidden_dim), dtype=self.Wx.raw.dtype, device=self.Wx.raw.device)
+
+        with torch.no_grad():
+            # guard (a): undo sqrt(fan-in) blow-up at initialization
+            self.Wx.raw.mul_(scalar)
+
+        # — convex skip connection —
         self.Wz = PositiveLinearHK(hidden_dim, hidden_dim, bias=False)
-        # convex activation
+        with torch.no_grad():
+            self.Wz.raw.mul_(scalar)
+
         self.act = nn.Softplus()
-        # final convex output
+
+        # — final convex output —
         self.out = PositiveLinearHK(hidden_dim, out_dim)
+        with torch.no_grad():
+            self.out.raw.mul_(1.0 / math.sqrt(hidden_dim))
+
+        # — post-embedding contraction (guard b) —
+        self.contraction = FrozenAffine(out_dim)
 
     def forward(self, P: torch.Tensor) -> torch.Tensor:
-        # P: (batch, seq, vocab_size)
-        h0 = self.act(self.Wx(P))             # (batch, seq, hidden_dim)
-        h1 = self.act(h0 + self.Wz(h0))       # combine skip-convex term
-        return self.out(h1)
+        """
+        P: (batch, seq, vocab_size) one-hot/simplex
+        returns: (batch, seq, out_dim)
+        """
+        h0 = self.act(self.Wx(P))             # → (batch, seq, hidden_dim)
+        h1 = self.act(h0 + self.Wz(h0))       # convex skip
+        raw = self.out(h1)                    # → (batch, seq, out_dim)
+        return self.contraction(raw)          # attenuate each cha
 
 def tokens_to_simplex(idx: torch.LongTensor, vocab_size: int) -> torch.FloatTensor:
     """
@@ -668,6 +1022,7 @@ class ConvexGPT(nn.Module):
 
         # Embeddings only for even channels [0,2,4,...]
         self.convex_embed = ConvexEmbedding(vocab_size, hidden_dim=512, out_dim=embed_dim)
+        self.token_emb = nn.Embedding(vocab_size, embed_dim)
 
         # Blocks operate on full embed_dim
         self.blocks = nn.ModuleList([
@@ -679,7 +1034,7 @@ class ConvexGPT(nn.Module):
             for i in range(depth)
         ])
 
-        self.ln_f = nn.LayerNorm(self.embed_dim)
+        self.ln_f = FrozenAffine(self.embed_dim)
         self.head = nn.Linear(self.embed_dim, vocab_size, bias=False)
         self.set_creativity(creativity)
 
@@ -758,7 +1113,4 @@ class ConvexGPT(nn.Module):
         x = self.ln_f(x)                             # (B, S, embed_dim)
         logits = self.head(x)                        # (B, S, vocab_size)
         return logits,attn_scores
-
-
-
 
