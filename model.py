@@ -414,7 +414,7 @@ class ScalarHull(nn.Module):
         self.in_dim = in_dim
         self.register_buffer('nu',  torch.tensor(1.64872127070012814684865078781416357165))
         self.register_buffer('noise_scale', torch.tensor(1e-5))
-        self.petals = KCN(self.in_dim, petals)
+        self.petals = BatchedICNN(self.in_dim, petals)
         self.gate   = ConvexGate(in_dim)
         self.register_buffer("creative", torch.tensor(True))
         self.register_buffer('eps', torch.tensor(1e-6))
@@ -716,7 +716,7 @@ class ConvexMixer(nn.Module):
         logK = logK - math.log(r)
 
         # 5) Assemble logits with mask and temperature
-        log_mask = torch.log(mask_back.clamp_min(self.eps))  # convert to log-domain
+        log_mask = torch.log(mask.clamp_min(self.eps))  # convert to log-domain
         scores = fq.unsqueeze(-1) + gk.unsqueeze(-2) + logK + log_mask  # additive
         
         logits = scores * tau.squeeze(-1).unsqueeze(-1)
