@@ -1,5 +1,9 @@
 #copyright joshuah rainstar 2025 joshuah.rainstar@gmail.com
 #licensed under convexgpt license if you do not agree please close this and delete any files related to this program
+#note this version of the model is not convex and was produced as a proof of concept for log space operations,
+#seeking to eliminate the minor discontinuity in logsumexp at max.
+#operating purely in log space is in fact more efficient.
+#Revisit this at a later state with more compute resources and time to perfect, updating to current convex model design specifications.
 
 import torch
 import torch.nn as nn
