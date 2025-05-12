@@ -416,28 +416,29 @@ class ScalarHull(nn.Module):
         self.register_buffer("creative", torch.tensor(True))
         self.register_buffer('eps', torch.tensor(1e-6))
         self.fused_lse_hulls = FusedLogSumExp(dim=-1)
-        self.tau_p = make_tau_spectrum(
-            points=petals,
-            tau_min=1.0/math.sqrt(math.e),
-            tau_max=math.e
-        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (..., D)
         g   = self.gate(x)                                   # (..., 1)
         xg   = x  * g 
-   
+        r = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+
+        alpha_max = math.log(1e4)              # ≈ 9.21034  → tau ≤ 1e4
+        alpha = r.clamp(max=alpha_max)
+
+        # 3. now exponentiate – cannot overflow
+        tau = torch.exp(alpha)               
         # ——— 2) scalar hull scores ———        # get each petal’s vector output, then reduce to scalar per petal
         out_all = self.petals(xg)                  # (..., P, D)
         scores  = out_all.mean(dim=-1)             # (..., P)
 
         # tempered LSE over petals
         # scaled: (..., P) = scores * τ
-        scaled = scores * self.tau_p          # (..., P)
+        scaled = scores          # (..., P)
         lse    = self.fused_lse_hulls(scaled)  # (..., 1)
 
         # divide by τ and squeeze
-        return lse.squeeze(-1)             # (...,)
+        return lse.squeeze(-1) /tau.squeeze(-1)           # (...,)
 
 class VectorHull(nn.Module):
     def __init__(self, dim: int, petals: int, out_dim: int = None):
@@ -447,31 +448,27 @@ class VectorHull(nn.Module):
         self.petals  = BatchedICNN(self.in_dim, petals,self.in_dim)
         self.gate    = ConvexGate(dim)
         self.fused_lse_hulls = FusedLogSumExp(dim=-1)
-        self.register_buffer('tau_p', make_tau_spectrum(
-            points=petals,
-            tau_min=1.0/math.sqrt(math.e),
-            tau_max=math.e
-        ))  # shape: (P,)
+        self.register_buffer('eps', torch.tensor(1e-6))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, S, D)
         g  = self.gate(x)               # (B, S, 1)
         xg = x * g                      # (B, S, D)
+        r = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
+        alpha_max = math.log(1e4)              # ≈ 9.21034  → tau ≤ 1e4
+        alpha = r.clamp(max=alpha_max)
+
+        # 3. now exponentiate – cannot overflow
+        tau = torch.exp(alpha)               
         # Get per-petal vectors
         out_all = self.petals(xg)       # (B, S, P, D)
 
-        # Broadcast tau_p over (B, S, P, D)
-        #   tau_p: (P,) → (1, 1, P, 1)
-        tau = self.tau_p.view(1, 1, -1, 1)
-
-        # Scale and aggregate via log-sum-exp
-        scaled = out_all * tau          # (B, S, P, D)
-        scaled = scaled.transpose(-2, -1)      # (B, S, D, P)
+        scaled = out_all.transpose(-2, -1)      # (B, S, D, P)
         lse    = self.fused_lse_hulls(scaled)  # (B, S, D, 1)
         lse    = lse.squeeze(-1)              # (B, S, D)
 
-        return lse
+        return lse/tau #required scaling
 
 '''
 | ingredient                    | must be convex in x? | must be x-independent? | why it matters                          |
@@ -560,11 +557,6 @@ class ConvexMixer(nn.Module):
         self.register_buffer('nu', torch.tensor(1.64872127070012814684865078781416357165))
 
         # static per-feature τ spectrum
-        self.tau_p = make_tau_spectrum(
-            points=r,
-            tau_min=1.0/math.sqrt(math.e),
-            tau_max=math.e
-        ).view(1,1,1,1,-1)  # shape (1,1,1,1,r) for broadcasting
 
         self.coord_map = CoordinateMapper(d_k, d_k*2)
         self.manifold = BatchedICNN(in_dim=d_k*2, petals=8, out_dim=d_k)
@@ -595,7 +587,6 @@ class ConvexMixer(nn.Module):
         z     = log_q + log_k                              # (B,H,S,S,r)
 
         # ——— 3) apply per-feature τ before fused LSE ———
-        z = z * self.tau_p  # broadcast over (B,H,S,S,r)
         logK = self.fused(z).squeeze(-1)  # (B,H,S,S)
 
        # 5) Assemble logits with mask and temperature
