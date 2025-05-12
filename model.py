@@ -238,8 +238,10 @@ class ConvexGate(nn.Module):
         self.softplus = nn.Softplus()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        u = self.softplus(self.lin(x))      # convex, ≥ 0
-        return 1.0 - torch.exp(-u)       # convex, ∈ (0,1)
+        u = self.softplus(self.lin(x))
+        u = u.clamp(max=1.0)  # or test 0.5, 2.0
+        g = 1.0 - torch.exp(-u)
+        return g #convex and tightly bound
 
 #based on BatchedICNN but with additional stuff inspired by KAN networks.
 
@@ -369,7 +371,29 @@ class FusedLogSumExp(nn.Module):
     @torch.jit.ignore
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _FusedLogSumExp.apply(x, self.dim)
-
+        
+def make_tau_spectrum(points: int, tau_min: float, tau_max: float) -> torch.Tensor:
+    # 1) linear [0,1) with `points` samples
+    f = torch.arange(points, dtype=torch.float32) / points  # shape (points,)
+    
+    # 2) apply the logit-style transform on the interior
+    x = f.clone()
+    inner = x[1:-1]                   # exclude first & last
+    inner = inner / (1.0 - inner)     # x/(1-x)
+    inner = inner.log()               # logit
+    x[1:-1] = inner
+    
+    # 3) reflect to enforce exact symmetry at the ends
+    x[-1] = 2 * x[-2] - x[-3]
+    x[ 0] = -x[-1]
+    
+    # 4) rescale into [0,1]
+    lo, hi = x[0], x[-1]
+    x = (x - lo) / (hi - lo)
+    
+    # 5) stretch into your [tau_min, tau_max] range
+    tau = tau_min + x * (tau_max - tau_min)
+    return tau  # shape (points,)
 class ScalarHull(nn.Module):
     def __init__(self, in_dim: int, petals: int):
         super().__init__()
@@ -381,41 +405,28 @@ class ScalarHull(nn.Module):
         self.register_buffer("creative", torch.tensor(True))
         self.register_buffer('eps', torch.tensor(1e-6))
         self.fused_lse_hulls = FusedLogSumExp(dim=-1)
+        self.tau_p = make_tau_spectrum(
+            points=petals,
+            tau_min=1.0/math.sqrt(math.e),
+            tau_max=math.e
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (..., D)
         g   = self.gate(x)                                   # (..., 1)
-
-        #creativity toggle here
-
-        if self.creative:
-            xg   = (x + torch.randn_like(x) * self.noise_scale) * g # (..., D)
-        else:
-            xg   = x  * g # (..., D)
-
-        # compute τ using a soft logistic
-        r = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        # 1. compute the exponent argument
-        alpha = 0.30343 * r + 0.22159          # (..., 1)
-        
-        # 2. clamp *before* the exp to a safe upper bound
-        alpha_max = math.log(1e4)              # ≈ 9.21034  → tau ≤ 1e4
-        alpha = alpha.clamp(max=alpha_max)
-        
-        # 3. now exponentiate – cannot overflow
-        tau = torch.exp(alpha)                 # (..., 1)  ≤ 1e4        
+        xg   = x  * g 
+   
         # ——— 2) scalar hull scores ———        # get each petal’s vector output, then reduce to scalar per petal
         out_all = self.petals(xg)                  # (..., P, D)
         scores  = out_all.mean(dim=-1)             # (..., P)
 
         # tempered LSE over petals
         # scaled: (..., P) = scores * τ
-        scaled = scores * tau                     # broadcasts τ→[...,1]→[...,P]
-
+        scaled = scores * self.tau_p          # (..., P)
         lse    = self.fused_lse_hulls(scaled)  # (..., 1)
 
         # divide by τ and squeeze
-        return (lse / tau).squeeze(-1)             # (...,)
+        return lse.squeeze(-1)             # (...,)
 
 class VectorHull(nn.Module):
     def __init__(self, dim: int, petals: int, out_dim: int = None):
@@ -428,42 +439,28 @@ class VectorHull(nn.Module):
         self.register_buffer("creative", torch.tensor(True))
         self.register_buffer('eps', torch.tensor(1e-6))
         self.fused_lse_hulls = FusedLogSumExp(dim=-1)
-
+        self.register_buffer('nu',  torch.tensor(1.64872127070012814684865078781416357165))
+        self.tau_p = make_tau_spectrum(
+            points=petals,
+            tau_min=1.0/math.sqrt(math.e),
+            tau_max=math.e
+        )
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (..., in_dim)
+        # … compute `out_all` of shape (..., P, out_dim) …
         g = self.gate(x)  # (..., 1)
 
-        # apply creativity scaling
-        if self.creative:
-            xg = (x + torch.randn_like(x) * self.noise_scale) * g  # (..., in_dim)
-        else:
-            xg = x * g
 
-        # compute τ
-        r = torch.sqrt(xg.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        # 1. compute the exponent argument
-        alpha = 0.30343 * r + 0.22159          # (..., 1)
-        
-        # 2. clamp *before* the exp to a safe upper bound
-        alpha_max = math.log(1e4)              # ≈ 9.21034  → tau ≤ 1e4
-        alpha = alpha.clamp(max=alpha_max)
-        
-        # 3. now exponentiate – cannot overflow
-        tau = torch.exp(alpha)                 # (..., 1)  ≤ 1e4        # ——— 2) scalar hull scores ———
-        # batched ICNN output (..., P, out_dim)
-        out_all = self.petals(xg)  # (..., P, out_dim)
-
-        # scale each vector per petal
-        scaled = out_all * tau.unsqueeze(-1)  # (..., P, out_dim)
-
-        # transpose petals to last dim for LSE
-        scaled = scaled.transpose(-2, -1)     # (..., out_dim, P)
-
-        # fused LSE over petals
-        lse = self.fused_lse_hulls(scaled).squeeze(-1)  # (..., out_dim)
-
-        # divide out τ
-        return lse / tau  # (..., out_dim)
+        xg = x * g
+        out_all = self.petals(xg) 
+        # we'd previously have dynamic τ; now:
+        # broadcast to (..., P, 1)
+        tau = self.tau_p.view(*(1,)* (x.ndim-1), -1, 1)  # match (...,P,1)
+        scaled = out_all * tau                         # (...,P,D)
+        # transpose last two dims to (… , D, P)
+        scaled = scaled.transpose(-2, -1)
+        lse = self.fused_lse_hulls(scaled).squeeze(-1)  # (..., D)
+        return lse 
 
 '''
 | ingredient                    | must be convex in x? | must be x-independent? | why it matters                          |
@@ -595,7 +592,6 @@ class ConstValueBank(nn.Module):
 
         # slice only the needed prototypes
         V_use = self.V[:, :n, :]                              # (H, n, d_k)
-
         # ------- flat (single-level) path ------------------------------
         if self.flat:
             # einsum: (B,H,S,n) × (H,n,d_k)  →  (B,H,S,d_k)
@@ -608,6 +604,8 @@ class ConstValueBank(nn.Module):
 
         # combine per-head coarse/fine
         V_coarse = torch.einsum("bhsK,hKmd->bhsmd", A1, V_hkm)  # (B,H,S,M,d_k)
+        
+        
         return V_coarse.sum(-2)                               # (B,H,S,d_k)
 #
 # USAGE IN ConvexMixer
@@ -643,87 +641,80 @@ class FusedLogSumExp4D(nn.Module):
     @torch.jit.ignore
     def forward(self, x: torch.Tensor):
         return _FusedLogSumExp4D.apply(x)
-        
+
+
+
 class ConvexMixer(nn.Module):
-    def __init__(self,heads:int, d_k: int, r: int):
+    def __init__(self, heads: int, d_k: int, r: int):
         super().__init__()
         self.register_buffer('eps', torch.tensor(1e-6))
         self.register_buffer('noise_scale', torch.tensor(1e-5))
 
         self.score_q = ScalarHull(d_k, 8)
         self.score_k = ScalarHull(d_k, 8)
-        self.gate = nn.Softplus()
+        self.gate    = nn.Softplus()
         self.lin_h_q = nn.Linear(d_k, r, bias=False)
         self.lin_h_k = nn.Linear(d_k, r, bias=False)
         self.register_buffer('creative', torch.tensor(True))
-        self.fused = FusedLogSumExp(dim=-1)
-        self.bank = ConstValueBank(heads, d_k,flat_dict=True)
-        self.fused4d = FusedLogSumExp4D()
+        self.fused    = FusedLogSumExp(dim=-1)
+        self.bank     = ConstValueBank(heads, d_k, flat_dict=True)
+        self.fused4d  = FusedLogSumExp4D()
+        self.register_buffer('nu', torch.tensor(1.64872127070012814684865078781416357165))
+
+        # static per-feature τ spectrum
+        self.tau_p = make_tau_spectrum(
+            points=r,
+            tau_min=1.0/math.sqrt(math.e),
+            tau_max=math.e
+        ).view(1,1,1,1,-1)  # shape (1,1,1,1,r) for broadcasting
 
     def forward(self, q, k, v, mask):
         B, H, S, D = q.shape
-        device = q.device
 
-        # ——— 1) tau ———
-        gate_q = self.gate(q)                          # (B,H,S,d_k)
+        # ——— 1) score branches ———
+        gate_q = self.gate(q)
         q = q * gate_q
-        r = torch.sqrt(q.pow(2).mean(-1, keepdim=True) + self.eps)
-        # 1. compute the exponent argument
-        alpha = 0.30343 * r + 0.22159          # (..., 1)
-        
-        # 2. clamp *before* the exp to a safe upper bound
-        alpha_max = math.log(1e4)              # ≈ 9.21034  → tau ≤ 1e4
-        alpha = alpha.clamp(max=alpha_max)
-        
-        # 3. now exponentiate – cannot overflow
-        tau = torch.exp(alpha)                 # (..., 1)  ≤ 1e4        # ——— 2) scalar hull scores ———
-        fq = self.score_q(q)  # (B,H,S)
-        gk = self.score_k(k)  # (B,H,S)
+        fq = self.score_q(q)            # (B,H,S)
+        gk = self.score_k(k)            # (B,H,S)
+
         if self.creative:
             qn = (torch.rand_like(q) - 0.5) * self.noise_scale
             kn = (torch.rand_like(k) - 0.5) * self.noise_scale
-            fq_ = self.score_q(q + qn)
-            gk_ = self.score_k(k + kn)
-            delta_fq = (fq_ - fq).detach()
-            delta_gk = (gk_ - gk).detach()
-            fq = fq - 0.1 * delta_fq
-            gk = gk - 0.1 * delta_gk
+            fq_ = self.score_q(q + qn);  delta_fq = (fq_ - fq).detach();  fq  = fq  - 0.1 * delta_fq
+            gk_ = self.score_k(k + kn);  delta_gk = (gk_ - gk).detach();  gk  = gk  - 0.1 * delta_gk
 
-        # ——— 3) random-feature kernel ———
+        # ——— 2) random-feature kernel ———
         phi_q = self.gate(self.lin_h_q(q).clamp(max=20.0))
         phi_k = self.gate(self.lin_h_k(k).clamp(max=20.0))
         phi_q = phi_q / (phi_q.sum(dim=-1, keepdim=True) + self.eps)
         phi_k = phi_k / (phi_k.sum(dim=-1, keepdim=True) + self.eps)
-        #convexity preserving normalization
-        log_phi_q = torch.log(phi_q + self.eps)
-        log_phi_k = torch.log(phi_k + self.eps)
-        logK = self.fused((phi_q+self.eps).log().unsqueeze(-2)
-               + (phi_k+self.eps).log().unsqueeze(-3)).squeeze(-1)
-        # subtract log(r) so it becomes log of the mean, not the sum
-        r = phi_q.size(-1)   # = number of random features
-        logK = logK - math.log(r)
 
-        # 5) Assemble logits with mask and temperature
-        log_mask = torch.log(mask.clamp_min(self.eps))  # convert to log-domain
-        scores = fq.unsqueeze(-1) + gk.unsqueeze(-2) + logK + log_mask  # additive
-        
-        logits = scores * tau.squeeze(-1).unsqueeze(-1)
-        log_weights = logits - self.fused4d(logits)
-        weights = torch.exp(log_weights)  # (B,H,S,S)
-        # in forward(), after log_weights → weights
-        # weights: (B, H, S, S)  →  row-simplex A
-        out = self.bank(weights)                  # (B, H, S, d_k)
-        # 6) Weighted sum for attention output
-        #out = weights.reshape(B * H, S, S).bmm(v.reshape(B * H, S, D))
-        #out = out.reshape(B, H, S, D)
+        log_q = torch.log(phi_q + self.eps).unsqueeze(-2)  # (B,H,S,1,r)
+        log_k = torch.log(phi_k + self.eps).unsqueeze(-3)  # (B,H,S,r,1)
+        z     = log_q + log_k                              # (B,H,S,S,r)
 
-        # Optional: compute aggregated attn_score
+        # ——— 3) apply per-feature τ before fused LSE ———
+        z = z * self.tau_p  # broadcast over (B,H,S,S,r)
+        logK = self.fused(z).squeeze(-1)  # (B,H,S,S)
+
+        # ——— 4) assemble logits & weights ———
+        log_mask = torch.log(mask.clamp_min(self.eps))
+        scores   = fq.unsqueeze(-1) + gk.unsqueeze(-2) + logK + log_mask  # (B,H,S,S)
+
+        log_weights = scores - self.fused4d(scores)
+        weights     = torch.exp(log_weights)  # (B,H,S,S)
+        out, _      = self.bank(weights), None  # (B,H,S,D)
+
+        # ——— 5) return output and attention score ———
         attn_score = weights.sum(dim=-3)
         attn_score = torch.softmax(attn_score, dim=-1).mean(dim=1)
-        min_vals = attn_score.min(dim=-1, keepdim=True).values
-        max_vals = attn_score.max(dim=-1, keepdim=True).values
-        attn_score = (attn_score - min_vals) / (max_vals - min_vals + self.eps)
+        min_v = attn_score.min(dim=-1, keepdim=True).values
+        max_v = attn_score.max(dim=-1, keepdim=True).values
+        attn_score = (attn_score - min_v) / (max_v - min_v + self.eps)
+
         return out, attn_score
+
+
 
 class InterleavedPhaseChannelizer(nn.Module):
     """
@@ -865,10 +856,15 @@ class PairwiseHullAttention(nn.Module):
         offset = self.rope(S, x.device)                  # (S, d_k//2)
         Q, K = apply_convex_rope(Q, K, offset) 
 
-        mean = 0.5 * (Q.mean() + K.mean())
-        std  = 0.5 * (Q.std()  + K.std())
-        Q = (Q - mean) / std
-        K = (K - mean) / std        
+        norm = 0.5 * (Q.norm(dim=(-2, -1)) + K.norm(dim=(-2, -1)))  # shape: (B, H)
+
+        # Reshape for broadcasting to Q/K shape (B, H, S, D)
+        norm = norm.unsqueeze(-1).unsqueeze(-1)  # (B, H, 1, 1)
+        
+        # Apply shared alignment norm
+        Q = Q / norm
+        K = K / norm 
+        #alignment but not really normalization as per alignment research
         y,attn_scores = self.mixer(Q, K, V, mask=mask)
         
         y = y.transpose(1, 2).reshape(B, S, self.embed_dim)
@@ -975,7 +971,9 @@ class ConvexEmbedding(nn.Module):
 def tokens_to_simplex(idx, vocab_size: int) -> torch.Tensor:
     P = F.one_hot(idx, num_classes=vocab_size).float()
     return P
-        
+
+
+
 # ----------------------------------------------------------------------
 #   GPT Wrapper with Causal Mask
 # ----------------------------------------------------------------------
@@ -1071,9 +1069,10 @@ class ConvexGPT(nn.Module):
         P = tokens_to_simplex(idx, self.vocab_size)       # (batch, seq, V)
         embeddings = self.convex_embed(P)                          # (batch, seq, d_model)
         x = torch.stack([embeddings, torch.zeros_like(embeddings)], dim=-1).reshape(idx.shape[0], idx.shape[1], self.embed_dim)
-
+     
+        
         # 3) build causal mask
-        mask = self.reversed_logistic_mask(S)          # (1, 1, S, S)
+        mask = self.logistic_mask(S)          # (1, 1, S, S)
 
         attn_scores = []
         # 4) apply each block (which will write φ into odd slots)
@@ -1085,5 +1084,7 @@ class ConvexGPT(nn.Module):
         # 5) final layernorm + head
         x = self.ln_f(x)                             # (B, S, embed_dim)
         logits = self.head(x)                        # (B, S, vocab_size)
+
+    
         return logits,attn_scores
 
