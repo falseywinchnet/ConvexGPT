@@ -206,6 +206,7 @@ class LinearPreMix(nn.Module):
         q = q.view(B, S, self.heads, self.d_k).transpose(1,2)
         k = k.view(B, S, self.heads, self.d_k).transpose(1,2)
         v = v.view(B, S, self.heads, self.d_k).transpose(1,2)
+
         return q, k, v
 
         
@@ -283,32 +284,32 @@ class BatchedICNN(nn.Module):
     Input-Convex Neural Network over batches of points,
     with additive convex gating to guarantee convexity.
     """
-    def __init__(self, in_dim: int, petals: int,out_dim: int):
-            super().__init__()
-            self.in_dim  = in_dim
-            self.out_dim = out_dim
-            self.P       = petals
-            D = in_dim
-            D_out = out_dim
-        
-            self.d1 = 2 * D
-            self.d2 = D_out  # instead of D
-        
-            self.layer0   = PositiveLinear3DHK(petals, D, self.d1)
-            self.layer1   = PositiveLinear3DHK(petals, self.d1, self.d2)
-            self.res_proj = PositiveLinear3DHK(petals, 2 * D, self.d2)
-        
-            self.gate0_net = ConvexGate(D, self.d1)
-            self.gate1_net = ConvexGate(D, self.d2)
-            self.extra_gate0_nets = nn.ModuleList([
-                ConvexGate(D, self.d1) for _ in range(self.P)
-            ])
-            self.extra_gate1_nets = nn.ModuleList([
-                ConvexGate(D, self.d2) for _ in range(self.P)
-            ])
-        
-            self.out_bias = nn.Parameter(torch.zeros(petals, self.d2))
-            self.act      = nn.Softplus()
+    def __init__(self, in_dim: int, petals: int, out_dim: int):
+        super().__init__()
+        self.in_dim  = in_dim
+        self.out_dim = out_dim
+        self.P       = petals
+        D = in_dim
+        D_out = out_dim
+
+        self.d1 = 2 * D
+        self.d2 = D_out  # instead of D
+
+        self.layer0   = PositiveLinear3DHK(petals, D, self.d1)
+        self.layer1   = PositiveLinear3DHK(petals, self.d1, self.d2)
+        self.res_proj = PositiveLinear3DHK(petals, 2 * D, self.d2)
+
+        self.gate0_net = ConvexGate(D, self.d1)
+        self.gate1_net = ConvexGate(D, self.d2)
+        self.extra_gate0_nets = nn.ModuleList([
+            ConvexGate(D, self.d1) for _ in range(self.P)
+        ])
+        self.extra_gate1_nets = nn.ModuleList([
+            ConvexGate(D, self.d2) for _ in range(self.P)
+        ])
+
+        self.out_bias = nn.Parameter(torch.zeros(petals, self.d2))
+        self.act      = nn.Softplus()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (..., D)
@@ -318,40 +319,41 @@ class BatchedICNN(nn.Module):
 
         # compute vector gates and expand over petals
         g0 = self.gate0_net(x_flat)               # (N, d1)
-        g0 = g0.unsqueeze(0).expand(self.P, N, self.d1)  
+        g0 = g0.unsqueeze(0).expand(self.P, N, self.d1)
         g1 = self.gate1_net(x_flat)               # (N, d2)
         g1 = g1.unsqueeze(0).expand(self.P, N, self.d2)
 
-        # petal inputs
-        x_in = x_flat.unsqueeze(0).expand(self.P, N, self.d2)  # (P, N, D)
+        # petal inputs (use in_dim, not d2)
+        x_in = x_flat.unsqueeze(0).expand(self.P, N, self.in_dim)  # (P, N, D)
 
         # layer0 + additive gating
-        z0 = self.layer0(x_in)                     # (P, N, 2D)
-        z0 = self.act(z0 + g0)                     # (P, N, 2D)
+        z0 = self.layer0(x_in)                     # (P, N, d1)
+        z0 = self.act(z0 + g0)                     # (P, N, d1)
 
         # extra per-petal additive gates
         extra0 = torch.stack([g(x_flat) for g in self.extra_gate0_nets], dim=0)
-        z0 = self.act(z0 + extra0)                 # (P, N, 2D)
+        z0 = self.act(z0 + extra0)                 # (P, N, d1)
 
         # layer1 + additive gating
-        z1 = self.layer1(z0)                       # (P, N, D)
-        z1 = self.act(z1 + g1)                     # (P, N, D)
+        z1 = self.layer1(z0)                       # (P, N, d2)
+        z1 = self.act(z1 + g1)                     # (P, N, d2)
 
         extra1 = torch.stack([g(x_flat) for g in self.extra_gate1_nets], dim=0)
-        z1 = self.act(z1 + extra1)                 # (P, N, D)
+        z1 = self.act(z1 + extra1)                 # (P, N, d2)
 
-        # residual path
-        res_in = x_flat.unsqueeze(0).expand(self.P, N, self.d2)
-        res_in = torch.cat([res_in, res_in], dim=-1)  # (P, N, 2D)
-        res    = self.res_proj(res_in)                # (P, N, D)
+        # residual path (use in_dim for expansion)
+        res_in = x_flat.unsqueeze(0).expand(self.P, N, self.in_dim)  # (P, N, D)
+        res_in = torch.cat([res_in, res_in], dim=-1)  # (P, N, 2*D)
+        res    = self.res_proj(res_in)                # (P, N, d2)
 
         # combine + bias
-        out = self.act(z1 + res) + self.out_bias.unsqueeze(1)  # (P, N, D)
+        out = self.act(z1 + res) + self.out_bias.unsqueeze(1)  # (P, N, d2)
 
-        # reshape back to original batch dims + petals + D
-        out = out.permute(1, 0, 2)  # (N, P, out_dim)
+        # reshape back to original batch dims + petals + D_out
+        out = out.permute(1, 0, 2)  # (N, P, d2)
         new_shape = list(orig_shape[:-1]) + [self.P, self.out_dim]
         return out.reshape(new_shape)
+
 
 
 class _FusedLogSumExp(torch.autograd.Function):
@@ -445,7 +447,7 @@ class VectorHull(nn.Module):
         super().__init__()
         self.in_dim  = dim
         self.out_dim = out_dim if out_dim is not None else dim
-        self.petals  = BatchedICNN(self.in_dim, petals,self.in_dim)
+        self.petals  = BatchedICNN(self.in_dim, petals, self.out_dim)
         self.gate    = ConvexGate(dim)
         self.fused_lse_hulls = FusedLogSumExp(dim=-1)
         self.register_buffer('eps', torch.tensor(1e-6))
@@ -467,45 +469,9 @@ class VectorHull(nn.Module):
         scaled = out_all.transpose(-2, -1)      # (B, S, D, P)
         lse    = self.fused_lse_hulls(scaled)  # (B, S, D, 1)
         lse    = lse.squeeze(-1)              # (B, S, D)
-
         return lse/tau #required scaling
 
-'''
-| ingredient                    | must be convex in x? | must be x-independent? | why it matters                          |
-| ----------------------------- | -------------------- | ---------------------- | --------------------------------------- |
-| **(1) Row weights A(x)**      | **yes**              | no                     | keeps each token inside the convex hull |
-| **(2) Value bank V**          | no                   | **yes**                | to avoid a bilinear term A(x)V(x)       |
-| **(3) Read-out** $f(x)=A(x)V$ | convex               | –                      | composition of (1)+(2)                  |
 
-The problem we must solve for Softmax-attention is that both (1) and (2) depended on x, so f(x) was not convex. 
-We already replaced (1) by a convex ICNN; The existing attention softmax already gives a convex row simplex.
-Getting V to work while being x-independent is the next step.
-
-the open question is how to make (2) powerful enough  while keeping it independent of x. 
-
-“intelligence is pattern matching over learned(updatable) priors” —is compatible with a constant value bank:
-
-The priors live in V.
-The map A merely selects and blends those priors according to the current pattern. Training still refines both:
-V learns richer prototype patterns (a larger, static—but trainable—knowledge base).
-A(x) (an ICNN) learns to map inputs to a distribution over that base.
-
-Because V is not a function of x, convexity holds; because V is learned, expressivity remains.
-the input decides where to look, not what it finds.
-
-'''
-#
-# USAGE IN ConvexMixer
-# --------------------
-# 1.  mixer = ConvexMixer(...);   bank = ConstValueBank(heads, d_k)
-# 2.  logits → A (row-simplex)  shape (B,H,S,N_total)
-# 3.  out = bank(A)     # convex combination of prototypes
-# 4.  Replace v-dependent matmul entirely.
-#flat_dict=True → uses a single-level bank of size N_total. Simple, cost O(S·N).
-#flat_dict=False → two-level (coarse×fine) routing, cost ~O(S·√N). Larger models.
-# This keeps f(x)=A(x)@V convex, hull-preserving, and scales with (d_k, S)
-# as per the table above.
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class _FusedLogSumExp4D(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor):
@@ -530,79 +496,58 @@ class FusedLogSumExp4D(nn.Module):
         return _FusedLogSumExp4D.apply(x)
 from typing import Tuple
 
-# --- Coordinate mapper (u) ---
-class CoordinateMapper(nn.Module):
-    def __init__(self, input_dim: int, coord_dim: int):
-        super().__init__()
-        self.linear = nn.Linear(input_dim, coord_dim, bias=True)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (..., input_dim)
-        return self.linear(x)
-        
 class ConvexMixer(nn.Module):
-    def __init__(self, heads: int, d_k: int, r: int):
+    def __init__(self, d_k: int, petals: int, r: int):
         super().__init__()
         self.register_buffer('eps', torch.tensor(1e-6))
         self.register_buffer('noise_scale', torch.tensor(1e-5))
 
-        self.score_q = ScalarHull(d_k, 8)
-        self.score_k = ScalarHull(d_k, 8)
-        self.gate    = nn.Softplus()
+        self.score_q = ScalarHull(d_k, petals)
+        self.score_k = ScalarHull(d_k, petals)
+        self.gate = nn.Softplus()
+        self.gatek = nn.Softplus()
+
         self.lin_h_q = nn.Linear(d_k, r, bias=False)
         self.lin_h_k = nn.Linear(d_k, r, bias=False)
         self.register_buffer('creative', torch.tensor(True))
-        self.fused    = FusedLogSumExp(dim=-1)
+        self.fused = FusedLogSumExp(dim=-1)
         self.fused4d  = FusedLogSumExp4D()
-        self.register_buffer('nu', torch.tensor(1.64872127070012814684865078781416357165))
-
-        # static per-feature τ spectrum
-
-        self.coord_map = CoordinateMapper(d_k, d_k*2)
-        self.manifold = BatchedICNN(in_dim=d_k*2, petals=8, out_dim=d_k)
 
     def forward(self, q, k, v, mask):
         B, H, S, D = q.shape
+        device = q.device
 
-        # ——— 1) score branches ———
-        gate_q = self.gate(q)
+        # ——— 1) tau ———
+        gate_q = self.gate(q)                          # (B,H,S,d_k)
+        gate_k = self.gatek(k)                          # (B,H,S,d_k)
+
         q = q * gate_q
-        fq = self.score_q(q)            # (B,H,S)
-        gk = self.score_k(k)            # (B,H,S)
+        k = k * gate_k
+        r = torch.sqrt(q.pow(2).mean(-1, keepdim=True) + self.eps)
 
-        if self.creative:
-            qn = (torch.rand_like(q) - 0.5) * self.noise_scale
-            kn = (torch.rand_like(k) - 0.5) * self.noise_scale
-            fq_ = self.score_q(q + qn);  delta_fq = (fq_ - fq).detach();  fq  = fq  - 0.1 * delta_fq
-            gk_ = self.score_k(k + kn);  delta_gk = (gk_ - gk).detach();  gk  = gk  - 0.1 * delta_gk
-
-        # ——— 2) random-feature kernel ———
+        # ——— 2) scalar hull scores ———
+        fq = self.score_q(q)  # (B,H,S)
+        gk = self.score_k(k)  # (B,H,S)
+ 
+        # ——— 3) random-feature kernel ———
         phi_q = self.gate(self.lin_h_q(q).clamp(max=20.0))
         phi_k = self.gate(self.lin_h_k(k).clamp(max=20.0))
-        phi_q = phi_q / (phi_q.sum(dim=-1, keepdim=True) + self.eps)
-        phi_k = phi_k / (phi_k.sum(dim=-1, keepdim=True) + self.eps)
+        log_phi_q = torch.log(phi_q + self.eps)
+        log_phi_k = torch.log(phi_k + self.eps)
+        logK = self.fused((phi_q+self.eps).log().unsqueeze(-2)
+               + (phi_k+self.eps).log().unsqueeze(-3)).squeeze(-1)
+        # subtract log(r) so it becomes log of the mean, not the sum
+        r = phi_q.size(-1)   # = number of random features
+        logK = logK - math.log(r)
 
-        log_q = torch.log(phi_q + self.eps).unsqueeze(-2)  # (B,H,S,1,r)
-        log_k = torch.log(phi_k + self.eps).unsqueeze(-3)  # (B,H,S,r,1)
-        z     = log_q + log_k                              # (B,H,S,S,r)
-
-        # ——— 3) apply per-feature τ before fused LSE ———
-        logK = self.fused(z).squeeze(-1)  # (B,H,S,S)
-
-       # 5) Assemble logits with mask and temperature
+        # 5) Assemble logits with mask and temperature
         log_mask = torch.log(mask.clamp_min(self.eps))  # convert to log-domain
-        logits = fq.unsqueeze(-1) + gk.unsqueeze(-2) + logK + log_mask  # additive
+        scores = fq.unsqueeze(-1) + gk.unsqueeze(-2) + logK + log_mask -r
         
-        log_weights = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+        log_weights = scores - self.fused4d(scores)
         weights = torch.exp(log_weights)  # (B,H,S,S)
 
-
-        #break the loop, and achieve intuition
-        v_flat = v.reshape(-1, D)
-        coords = self.coord_map(v_flat)               # (B*H*S, coord_dim)
-        val_flat = self.manifold(coords)              # (B*H*S, D)
-        val = val_flat.view(B, H, S, D)
-        
         # 6) Weighted sum for attention output
         out = weights.reshape(B * H, S, S).bmm(v.reshape(B * H, S, D))
         out = out.reshape(B, H, S, D)
@@ -617,69 +562,68 @@ class ConvexMixer(nn.Module):
         return out, attn_score
 
 
-
-
-class InterleavedPhaseChannelizer(nn.Module):
-    """
-    Embedding shape: (B, T, 2*M) == [c0, ϕ0, c1, ϕ1, ..., c_{M-1}, ϕ_{M-1}].
-    Now uses a convex bump kernel instead of sine.
-    """
-    def __init__(self, embed_dim: int, init_gate_bias: float = -3.0, eps: float = 1e-6):
+        
+class PhaseChannelizer(nn.Module):
+    def __init__(self, embed_dim: int, init_gate_bias: float = -3.0,
+                 eps: float = 1e-6, window_size: int = 15):
         super().__init__()
         assert embed_dim % 2 == 0, "embed_dim must be even"
-        self.M = embed_dim // 2
-        self.gate_raw = nn.Parameter(torch.full((self.M,), init_gate_bias))
-        self.softplus = nn.Softplus()
-        self.eps = eps
+        self.M           = embed_dim // 2
+        self.gate_raw    = nn.Parameter(torch.full((self.M,), init_gate_bias))
+        self.softplus    = nn.Softplus()
+        self.eps         = eps
+        self.window_size = window_size
 
     def bump_kernel(self, T: int, device: torch.device):
         """
-        Returns a (T, T) kernel K[i,j] ∈ (0,1], convex in |j-i|,
-        with K[i,i]=1, and smoothly → eps as j→end.
+        Returns a (T, T) kernel K[i,j], convex in (i-j), only for j in [i-window, i],
+        zero elsewhere, with K[i,i]=1, and smoothly → eps as (i-j)→window.
         """
-        i = torch.arange(T, device=device).unsqueeze(1).float()      # (T,1)
-        j = torch.arange(T, device=device).unsqueeze(0).float()      # (1,T)
+        i = torch.arange(T, device=device).unsqueeze(1).float()   # (T,1)
+        j = torch.arange(T, device=device).unsqueeze(0).float()   # (1,T)
 
-        # future offset u = (j - i) / (T - i)
-        diff    = (j - i).clamp(min=0.0)                            # (T,T)
-        horizon = (T - i).clamp(min=1.0)                            # (T,1)
-        u       = (diff / horizon).clamp(max=1.0 - self.eps)        # [0,1)
+        # 1) how far into the past: diff = i-j, clipped to [0, window_size]
+        diff = (i - j).clamp(min=0, max=self.window_size)        # (T,T)
 
-        # bump exponent: convex, =1 at u=0, → -∞ as u→1
+        # 2) normalized past‐fraction in [0,1)
+        u = (diff / self.window_size).clamp(max=1.0 - self.eps)  # (T,T)
+
+        # 3) convex exponent: =1 at diff=0, → -∞ as u→1
         expnt = 1.0 - 1.0 / (1.0 - u*u + self.eps)
-        K      = torch.exp(expnt)                                   # (T,T)
+        K = torch.exp(expnt)
 
-        # enforce exact eps at u≈1
-        K = torch.where(u >= 1.0 - self.eps, torch.full_like(K, self.eps), K)
+        # 4) zero out anything beyond window
+        K = torch.where((i - j) > self.window_size, 
+                        torch.zeros_like(K), 
+                        K)
+
         return K  # (T,T)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, 2*M)
         B, T, _ = x.shape
         M       = self.M
         device  = x.device
         dtype   = x.dtype
 
         # 1) content channels
-        x_c = x[..., 0::2]  # (B, T, M)
+        x_c = x  # (B, T, M)
 
-        # 2) build convex bump kernel and mask it
+        # 2) build 15‐step past bump kernel
         K = self.bump_kernel(T, device).to(dtype)   # (T,T)
-        causal2d = mask.view(T, T).to(dtype)        # (T,T)
-        K = K * causal2d                            # zero out masked-out positions
 
-        # 3) normalize rows to sum=1
+        # 3) enforce causality (if you still need your existing mask)
+        causal2d = mask.view(T, T).to(dtype)        # (T,T)
+        K = K * causal2d                            # zero out any j>i
+
+        # 4) normalize rows to sum=1
         K = K / (K.sum(-1, keepdim=True).clamp(min=self.eps))
 
-        # 4) accumulate phase φ[b,i,m] = ∑₍ⱼ₌₀…T₋₁₎ K[i,j] · x_c[b,j,m]
+        # 5) accumulate: φ[b,i,m] = ∑ⱼ K[i,j] · x_c[b,j,m]
         φ = torch.einsum('ij,bjm->bim', K, x_c)     # (B, T, M)
 
-        # 5) gate & write back into odd slots
+        # 6) gate & write back
         gate = self.softplus(self.gate_raw).view(1,1,M)  # (1,1,M)
-        φg   = φ * gate                                 # (B, T, M)
-        out  = x.clone()
-        out[..., 1::2] = φg
-        return out
+        return φ * gate
 
 class ConvexRoPE(nn.Module):
     """
@@ -745,44 +689,30 @@ class PairwiseHullAttention(nn.Module):
         self.heads = heads
         self.d_k = embed_dim // heads
         self.pre = LinearPreMix(embed_dim, heads)
-        self.mixer = ConvexMixer(heads,self.d_k, self.d_k*2)#dont need many for scoring
+        self.mixer = ConvexMixer(self.d_k, 8, self.d_k*2)#rarely more needed, try 16 for super big models
         self.W_O = nn.Linear(embed_dim, embed_dim, bias=False)
         self.phase = InterleavedPhaseChannelizer(embed_dim)
         self.register_buffer('noise_scale', torch.tensor(1e-5))
         self.register_buffer("creative", torch.tensor(True))
         self.rope = ConvexRoPE(self.d_k)
 
-    def forward(self, x, mask):
+    def forward(self, x, mask,backwardmask):
         #self.phase(x,mask) #apply in-place positional phasing
         B, S, E = x.shape
         Q, K, V= self.pre(x)
+
         offset = self.rope(S, x.device)                  # (S, d_k//2)
         Q, K = apply_convex_rope(Q, K, offset) 
-
-        Q_flat = Q.view(Q.size(0), Q.size(1), -1)
-        K_flat = K.view(K.size(0), K.size(1), -1)
-
-        norm = 0.5 * (Q_flat.norm(p=2, dim=-1) + K_flat.norm(p=2, dim=-1))  # (B, H)
-
-        # Reshape for broadcasting to Q/K shape (B, H, S, D)
-        norm = norm.unsqueeze(-1).unsqueeze(-1)  # (B, H, 1, 1)
-        
-        # Apply shared alignment norm
-        Q = Q / norm
-        K = K / norm 
-        #alignment but not really normalization as per alignment research
+        mean = 0.5 * (Q.mean() + K.mean())
+        std  = 0.5 * (Q.std()  + K.std())
+        Q = (Q - mean) / std
+        K = (K - mean) / std 
         y,attn_scores = self.mixer(Q, K, V, mask=mask)
         
         y = y.transpose(1, 2).reshape(B, S, self.embed_dim)
         return self.W_O(y), attn_scores
 
-# ────────────────────────────────────────────────────────────────────────
-# FixedGainNorm: affine-free, hull-preserving alternative to LayerNorm
-#   y = γ ⊙ x            with  γ = sigmoid(ρ)  ∈ (0,1)  (learned, constant)
-# • element-wise positive contraction (no centring, no data-dependent scale)
-# • convex in x  (linear with non-negative weights)
-# • for every token z  ⇒  y lies inside conv{0, z}  ⊂  conv{all z}   ⇒  hull-safe
-# ────────────────────────────────────────────────────────────────────────
+
 class FrozenAffine(nn.Module):
     def __init__(self, dim, eps=1e-5, momentum=0.02, freeze_after=1000):
         super().__init__()
@@ -819,10 +749,10 @@ class OmniHullBlock(nn.Module):
         self.res_gate1 = ConvexGate(dim)
         self.res_gate2 = ConvexGate(dim)
 
-    def forward(self, x, mask):
+    def forward(self, x, mask,backwardmask):
         # ——— attention branch ———
         x0, _ = x, None
-        x1, attn_scores = self.attn(self.ln1(x0), mask)   # x1 is the residual delta
+        x1, attn_scores = self.attn(self.ln1(x0), mask,backwardmask)   # x1 is the residual delta
         g1 = self.res_gate1(x0)                                      # shape (B,S,1)
         x  = x0 + g1 * x1
 
@@ -895,7 +825,6 @@ class ConvexGPT(nn.Module):
     ):
         super().__init__()
         assert embed_dim >= 1, "embed_channels must be ≥1"
-        #self.embed_dim = 2 * embed_dim
         self.vocab_size = vocab_size
 
         # Embeddings only for even channels [0,2,4,...]
@@ -978,11 +907,11 @@ class ConvexGPT(nn.Module):
         
         # 3) build causal mask
         mask = self.logistic_mask(S)          # (1, 1, S, S)
-
+        backwardmask = self.reversed_logistic_mask(S)
         attn_scores = []
         # 4) apply each block (which will write φ into odd slots)
         for blk in self.blocks:
-            x,attn_temp = blk(x, mask)
+            x,attn_temp = blk(x, mask,backwardmask)
             attn_scores.append(attn_temp)
 
         attn_scores =  torch.stack(attn_scores).mean(dim=0)#divide by heads
