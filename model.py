@@ -283,32 +283,32 @@ class BatchedICNN(nn.Module):
     Input-Convex Neural Network over batches of points,
     with additive convex gating to guarantee convexity.
     """
-    def __init__(self, in_dim: int, petals: int):
-        super().__init__()
-        self.in_dim = in_dim
-        self.P      = petals
-        D = in_dim
-        self.d1 = 2 * D
-        self.d2 = D
-
-        self.phi_proj = PositiveLinearHK(in_dim, in_dim)
-
-        self.layer0   = PositiveLinear3DHK(petals, D, self.d1)
-        self.layer1   = PositiveLinear3DHK(petals, self.d1, self.d2)
-        self.res_proj = PositiveLinear3DHK(petals, 2 * D, D)
-
-        # vector-valued convex gates matching each layer's output dim
-        self.gate0_net = ConvexGate(D, self.d1)
-        self.gate1_net = ConvexGate(D, self.d2)
-        self.extra_gate0_nets = nn.ModuleList([
-            ConvexGate(D, self.d1) for _ in range(self.P)
-        ])
-        self.extra_gate1_nets = nn.ModuleList([
-            ConvexGate(D, self.d2) for _ in range(self.P)
-        ])
-
-        self.out_bias = nn.Parameter(torch.zeros(petals, D))
-        self.act      = nn.Softplus()
+    def __init__(self, in_dim: int, petals: int,out_dim: int):
+            super().__init__()
+            self.in_dim  = in_dim
+            self.out_dim = out_dim
+            self.P       = petals
+            D = in_dim
+            D_out = out_dim
+        
+            self.d1 = 2 * D
+            self.d2 = D_out  # instead of D
+        
+            self.layer0   = PositiveLinear3DHK(petals, D, self.d1)
+            self.layer1   = PositiveLinear3DHK(petals, self.d1, self.d2)
+            self.res_proj = PositiveLinear3DHK(petals, 2 * D, self.d2)
+        
+            self.gate0_net = ConvexGate(D, self.d1)
+            self.gate1_net = ConvexGate(D, self.d2)
+            self.extra_gate0_nets = nn.ModuleList([
+                ConvexGate(D, self.d1) for _ in range(self.P)
+            ])
+            self.extra_gate1_nets = nn.ModuleList([
+                ConvexGate(D, self.d2) for _ in range(self.P)
+            ])
+        
+            self.out_bias = nn.Parameter(torch.zeros(petals, self.d2))
+            self.act      = nn.Softplus()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (..., D)
@@ -349,73 +349,9 @@ class BatchedICNN(nn.Module):
         out = self.act(z1 + res) + self.out_bias.unsqueeze(1)  # (P, N, D)
 
         # reshape back to original batch dims + petals + D
-        out = out.permute(1, 0, 2)  # (N, P, D)
-        lead = list(orig_shape[:-1])
-        return out.reshape(*lead, self.P, self.in_dim)
-
-
-        
-class ACN(nn.Module):
-    def __init__(self, in_dim: int, petals: int, out_dim: int = None, norm_target: float = 10.0):
-        """
-        norm_target – desired Frobenius norm of each petal's W2 matrix.
-        """
-        super().__init__()
-        self.in_dim  = in_dim
-        self.out_dim = out_dim if out_dim is not None else in_dim
-        self.P = petals
-        self.norm_target = norm_target
-        D_in, D_out = self.in_dim, self.out_dim
-
-        # Shared φ-projection
-        self.phi_proj = PositiveLinearHK(D_in, D_out)
-
-        # Second positive layer
-        self.w2 = PositiveLinear3DHK(petals, D_out, D_out)
-
-        self.b2        = nn.Parameter(torch.zeros(petals, D_out))
-        self.gate_raw2 = nn.Parameter(torch.full((petals,), -3.0))
-
-        # Residual
-        self.z_weight = nn.Parameter(torch.empty(petals, 2 * D_in, D_out))
-        nn.init.kaiming_uniform_(self.z_weight, a=math.sqrt(5))
-
-        # First-layer gate and output bias
-        self.gate_raw = nn.Parameter(torch.full((petals,), -3.0))
-        self.out_bias = nn.Parameter(torch.zeros(petals, D_out))
-
-        self.act = nn.Softplus()
-
-    # ------------------------------------------------------------------
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig   = x.shape
-        x_flat = x.reshape(-1, self.in_dim)           # (N, D_in)
-        N      = x_flat.size(0)
-
-        # φ(x)
-        phi = F.softplus(x_flat)                      # (N, D_in)
-        h   = self.phi_proj(phi)                      # (N, D_out)
-
-        # expand & gate 1
-        h = h.unsqueeze(0).expand(self.P, N, self.out_dim)   # (P,N,D_out)
-        g1 = torch.sigmoid(self.gate_raw).view(self.P,1,1)
-        z0 = self.act(h * g1)
-
-        # W2 (positive,Frobenius normed) + gate 2
-        z1 = self.w2(z0) 
-        g2 = torch.sigmoid(self.gate_raw2).view(self.P,1,1)
-        z1 = self.act(z1 * g2)
-
-        # residual
-        res = torch.cat([x_flat, x_flat], dim=-1).unsqueeze(0)
-        res = torch.bmm(res.expand(self.P, N, 2*self.in_dim), self.z_weight)
-
-        # combine + bias
-        out = self.act(z1 + res) + self.out_bias.unsqueeze(1)   # (P,N,D_out)
-        out = out.permute(1, 0, 2)  # (N, P, D)
-        lead_dims = list(orig[:-1])                 # e.g. [B, H, T]
-        new_shape = lead_dims + [self.P, self.in_dim]  # [B, H, T, P, D]
-        return out.reshape(new_shape)        
+        out = out.permute(1, 0, 2)  # (N, P, out_dim)
+        new_shape = list(orig_shape[:-1]) + [self.P, self.out_dim]
+        return out.reshape(new_shape)
 
 
 class _FusedLogSumExp(torch.autograd.Function):
@@ -475,7 +411,7 @@ class ScalarHull(nn.Module):
         self.in_dim = in_dim
         self.register_buffer('nu',  torch.tensor(1.64872127070012814684865078781416357165))
         self.register_buffer('noise_scale', torch.tensor(1e-5))
-        self.petals = ACN(self.in_dim, petals)
+        self.petals = BatchedICNN(self.in_dim, petals,self.in_dim)
         self.gate   = ConvexGate(in_dim)
         self.register_buffer("creative", torch.tensor(True))
         self.register_buffer('eps', torch.tensor(1e-6))
@@ -508,7 +444,7 @@ class VectorHull(nn.Module):
         super().__init__()
         self.in_dim  = dim
         self.out_dim = out_dim if out_dim is not None else dim
-        self.petals  = ACN(self.in_dim, petals)
+        self.petals  = BatchedICNN(self.in_dim, petals,self.in_dim)
         self.gate    = ConvexGate(dim)
         self.fused_lse_hulls = FusedLogSumExp(dim=-1)
         self.register_buffer('tau_p', make_tau_spectrum(
@@ -631,7 +567,7 @@ class ConvexMixer(nn.Module):
         ).view(1,1,1,1,-1)  # shape (1,1,1,1,r) for broadcasting
 
         self.coord_map = CoordinateMapper(d_k, d_k*2)
-        self.manifold = ACN(d_k*2, 8, out_dim=d_k)
+        self.manifold = BatchedICNN(in_dim=d_k*2, petals=8, out_dim=d_k)
 
     def forward(self, q, k, v, mask):
         B, H, S, D = q.shape
